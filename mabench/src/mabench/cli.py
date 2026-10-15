@@ -1,0 +1,220 @@
+"""mabench command line.
+
+  mabench prepare   raster file(s) -> tile store (one file per frame)
+  mabench synth     synthetic raster -> tile store
+  mabench inspect   print a store's manifest summary
+  mabench verify    checksums, completeness, padding (exit 1 on problems)
+  mabench workload  write workload.json for NES / GeoTrellis
+  mabench reference oracle result for a workload -> output store
+  mabench compare   candidate output vs reference output (exit 1 on FAIL)
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import sys
+from typing import Any
+
+from . import __version__
+from .sources import GENERATORS, RasterioSource, SyntheticSource
+from .storage import backend_for
+from .store import TileStore
+from .tiler import tile_source
+from .workloads import load_workload, parse_workload
+
+
+def _provenance(argv: list[str]) -> dict[str, Any]:
+    from datetime import datetime, timezone
+    return {"tool": "mabench", "version": __version__, "argv": argv,
+            "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _params(pairs: list[str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for pair in pairs:
+        k, sep, v = pair.partition("=")
+        if not sep:
+            raise SystemExit(f"--param expects key=value, got {pair!r}")
+        if "," in v:
+            out[k] = [float(t) for t in v.split(",")]
+        else:
+            try:
+                out[k] = float(v)
+            except ValueError:
+                out[k] = v
+    return out
+
+
+def _select_variable(path: str, variable: str) -> str:
+    """GDAL path of one variable inside a container file (NetCDF, HDF5, HDF4, Zarr, ...).
+
+    Containers expose their variables as subdatasets, e.g. ``NETCDF:"f.nc":CMI`` or
+    ``HDF5:"f.h5"://group/CMI``. The match is on the name after the last ':' or '/', so the
+    same --variable works for every container format GDAL can read.
+    """
+    import rasterio
+
+    with rasterio.open(path) as src:
+        subdatasets = list(src.subdatasets or [])
+    if not subdatasets:
+        raise SystemExit(f"{path}: --variable {variable} given, but the file has no variables "
+                         "(it is a plain raster; drop --variable)")
+    matches = [sd for sd in subdatasets if sd.replace("/", ":").rsplit(":", 1)[-1] == variable]
+    if len(matches) != 1:
+        names = ", ".join(sd.replace("/", ":").rsplit(":", 1)[-1] for sd in subdatasets)
+        raise SystemExit(f"{path}: no single variable named {variable!r}; available: {names}")
+    return matches[0]
+
+
+def _expand_inputs(inputs: list[str], variable: str | None) -> list[str]:
+    """Expand glob patterns ourselves (IDE run configurations do not go through a shell), sort the
+    matches so frames follow file-name (= time) order, and optionally select one variable per file."""
+    files: list[str] = []
+    for arg in inputs:
+        if any(c in arg for c in "*?[") and ":" not in arg.split("/")[0]:
+            matches = sorted(glob.glob(arg))
+            if not matches:
+                raise SystemExit(f"no files match {arg!r}")
+            files += matches
+        else:
+            files.append(arg)
+    return [_select_variable(f, variable) for f in files] if variable else files
+
+
+def _refuse_existing(location: str, force: bool) -> None:
+    if backend_for(location).exists("manifest.json") and not force:
+        raise SystemExit(f"{location} already holds a tile store; pass --force to overwrite")
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ap = argparse.ArgumentParser(prog="mabench", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=__version__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("prepare", help="tile raster file(s); each file becomes one frame")
+    p.add_argument("inputs", nargs="+", help="GDAL-readable files or glob patterns (GeoTIFF, COG, VRT, GRIB2, NetCDF); "
+                                         "patterns are expanded and sorted by mabench itself")
+    p.add_argument("--variable", help="variable to read from every container file (NetCDF, HDF5, HDF4, ...), "
+                                      "e.g. CMI for GOES; not needed for GeoTIFF, COG, VRT or GRIB2")
+    p.add_argument("--out", required=True, help="local directory or URL (s3://, gs://, ...)")
+    p.add_argument("--tile-size", type=int, required=True)
+    p.add_argument("--bands", help="comma-separated 1-based band indexes (default: all); all go into one maplet")
+    p.add_argument("--frame-period-ms", type=int, default=0, help="event time step between frames")
+    p.add_argument("--no-scale", action="store_true", help="do not apply scale/offset metadata")
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("synth", help="synthetic raster -> tile store")
+    p.add_argument("--out", required=True)
+    p.add_argument("--width", type=int, required=True)
+    p.add_argument("--height", type=int, required=True)
+    p.add_argument("--generator", required=True, choices=GENERATORS)
+    p.add_argument("--param", action="append", default=[], metavar="KEY=VALUE",
+                   help="generator / NoData parameter, e.g. nodata_fraction=0.1 or nodata_block=0,0,64,64")
+    p.add_argument("--bands", type=int, default=1)
+    p.add_argument("--frames", type=int, default=1)
+    p.add_argument("--frame-period-ms", type=int, default=1000)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--tile-size", type=int, required=True)
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("inspect", help="print a store's manifest summary")
+    p.add_argument("store")
+    p.add_argument("--json", action="store_true", help="print the full manifest")
+
+    p = sub.add_parser("verify", help="check a store")
+    p.add_argument("store")
+
+    p = sub.add_parser("workload", help="write a workload.json")
+    p.add_argument("spec", help="e.g. focal:mean:square:3")
+    p.add_argument("-o", "--out", required=True)
+
+    p = sub.add_parser("reference", help="compute the oracle result of a workload")
+    p.add_argument("store")
+    p.add_argument("--workload", required=True, help="workload.json or short spec (focal:mean:square:3)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("compare", help="compare a candidate output store with a reference output store")
+    p.add_argument("candidate", help="output store of the system under test (NES, GeoTrellis)")
+    p.add_argument("--reference", required=True, help="oracle output store (mabench reference)")
+    p.add_argument("--input", required=True, help="input store both outputs were computed from")
+    p.add_argument("--workload", help="workload.json or short spec; default: taken from the reference's provenance")
+    p.add_argument("--tau", type=float, default=1e-12, help="Sum/Mean tolerance factor (evaluation spec D3)")
+    p.add_argument("--json", help="write the full report (per frame and stratum) to this file")
+    p.add_argument("--heatmap", help="write an error heatmap of the first frame (PNG; needs matplotlib)")
+
+    args = ap.parse_args(argv)
+    say = lambda msg: print(msg, file=sys.stderr)
+
+    if args.cmd == "prepare":
+        _refuse_existing(args.out, args.force)
+        bands = [int(b) for b in args.bands.split(",")] if args.bands else None
+        src = RasterioSource(_expand_inputs(args.inputs, args.variable), bands=bands, frame_period_ms=args.frame_period_ms,
+                             apply_scale_offset=not args.no_scale)
+        m = tile_source(src, backend_for(args.out), args.tile_size, _provenance(argv), say)
+        say(f"wrote {len(m.frames)} frame(s), {m.tiling.tiles_x}x{m.tiling.tiles_y} tiles each, to {args.out}")
+    elif args.cmd == "synth":
+        _refuse_existing(args.out, args.force)
+        src = SyntheticSource(args.width, args.height, args.generator, _params(args.param),
+                              bands=args.bands, n_frames=args.frames, seed=args.seed,
+                              frame_period_ms=args.frame_period_ms)
+        m = tile_source(src, backend_for(args.out), args.tile_size, _provenance(argv), say)
+        say(f"wrote {len(m.frames)} frame(s) to {args.out}")
+    elif args.cmd == "inspect":
+        m = TileStore.open(args.store).manifest
+        if args.json:
+            print(json.dumps(m.to_dict(), indent=2))
+        else:
+            r, t = m.raster, m.tiling
+            total = sum(f.nbytes for f in m.frames)
+            cells = r.width * r.height * r.bands
+            print(f"raster   {r.width} x {r.height} x {r.bands} band(s), crs={r.crs}")
+            print(f"tiling   {t.tile_size}px, {t.tiles_x} x {t.tiles_y} tiles, {t.tile_order}, padding={t.edge_padding}")
+            print(f"frames   {len(m.frames)}, {total / 2**20:.1f} MiB on disk")
+            for f in m.frames[:10]:
+                print(f"  #{f.frame_id:<5} t={f.event_time_ms:<12} valid={f.valid_cells / cells:6.1%}  {f.sha256[:12]}")
+            if len(m.frames) > 10:
+                print(f"  ... {len(m.frames) - 10} more")
+    elif args.cmd == "verify":
+        report = TileStore.open(args.store).verify()
+        for problem in report.problems:
+            print(problem)
+        print("OK" if report.ok else f"{len(report.problems)} problem(s)")
+        return 0 if report.ok else 1
+    elif args.cmd == "workload":
+        w = parse_workload(args.spec)
+        w.save(args.out)
+        say(f"wrote {w.name} to {args.out}")
+    elif args.cmd == "reference":
+        _refuse_existing(args.out, args.force)
+        store = TileStore.open(args.store)
+        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        for note in w.validate(store.manifest):
+            say(f"{note.level}: {note.message}")
+        w.reference(store, args.out)
+        say(f"wrote reference for {w.name} to {args.out}")
+    elif args.cmd == "compare":
+        from .compare import save_report
+        from .workloads import workload_from_dict
+        inp, ref, cand = TileStore.open(args.input), TileStore.open(args.reference), TileStore.open(args.candidate)
+        if args.workload:
+            w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        elif "workload" in ref.manifest.provenance:
+            w = workload_from_dict(ref.manifest.provenance["workload"])
+        else:
+            raise SystemExit("reference has no workload in its provenance; pass --workload")
+        report = w.compare(inp, ref, cand, tau=args.tau, heatmap=args.heatmap)
+        print(f"{w.name}: {args.candidate} vs {args.reference}")
+        print(report.table())
+        if args.json:
+            save_report(report, args.json)
+        return 0 if report.passed else 1
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

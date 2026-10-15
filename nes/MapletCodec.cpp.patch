@@ -1,0 +1,81 @@
+--- a/nes-plugins/Functions/RasterFunctions/MapletCodec.cpp
++++ b/nes-plugins/Functions/RasterFunctions/MapletCodec.cpp
+@@ -13,6 +13,7 @@
+ #include <MapletCodec.hpp>
+ 
+ #include <cstdlib>
++#include <cerrno>
+ #include <charconv>
+ #include <cmath>
+ #include <limits>
+@@ -125,7 +126,7 @@
+         }
+         ++p;
+     }
+-    out = GridView{scratch, spec.height, spec.width, spec.noData};
++    out = GridView{scratch, spec.height, spec.width, spec.noData, spec.bands};
+     return CodecStatus::Ok;
+ }
+ 
+@@ -144,9 +145,9 @@
+     {
+         return CodecStatus::UnsupportedCellType;
+     }
+-    if (static_cast<uint8_t>(in[2]) != 1)  // single-band focal path
++    if (static_cast<uint8_t>(in[2]) != spec.bands)  // band count is a per-stream invariant
+     {
+-        return CodecStatus::BadDimensions;
++        return CodecStatus::SizeMismatch;
+     }
+     uint32_t h{};
+     uint32_t w{};
+@@ -162,7 +163,7 @@
+     {
+         return CodecStatus::SizeMismatch;
+     }
+-    const uint64_t cells = static_cast<uint64_t>(h) * w;
++    const uint64_t cells = static_cast<uint64_t>(spec.bands) * h * w;
+     const uint64_t need = BINARY_HEADER_SIZE + (cells * sizeof(double));
+     if (inSize < need)
+     {
+@@ -180,7 +181,7 @@
+     // caller retains it, out.cells could alias `in + BINARY_HEADER_SIZE` instead
+     // (true zero-copy). Deferred to the v2 retention path.
+     std::memcpy(scratch, in + BINARY_HEADER_SIZE, cells * sizeof(double));
+-    out = GridView{scratch, h, w, spec.noData};
++    out = GridView{scratch, h, w, spec.noData, spec.bands};
+     return CodecStatus::Ok;
+ }
+ 
+@@ -236,7 +237,7 @@
+     std::memset(out, 0, BINARY_HEADER_SIZE);  // zero the reserved bytes
+     out[0] = static_cast<int8_t>(WireFormat::Binary);
+     out[1] = static_cast<int8_t>(spec.cellType);
+-    out[2] = static_cast<int8_t>(1);
++    out[2] = static_cast<int8_t>(spec.bands);
+     const uint32_t h = grid.h;
+     const uint32_t w = grid.w;
+     std::memcpy(out + 4, &h, sizeof h);
+@@ -251,7 +252,7 @@
+ CodecStatus decode(const int8_t* in, uint64_t inSize, const TileSpec& spec, double* scratch, uint64_t scratchCells,
+                    GridView& out) noexcept
+ {
+-    if (spec.height == 0 || spec.width == 0)
++    if (spec.height == 0 || spec.width == 0 || spec.bands == 0)
+     {
+         return CodecStatus::BadDimensions;
+     }
+@@ -273,11 +274,11 @@
+                    uint64_t& bytesWritten) noexcept
+ {
+     bytesWritten = 0;
+-    if (spec.height == 0 || spec.width == 0)
++    if (spec.height == 0 || spec.width == 0 || spec.bands == 0)
+     {
+         return CodecStatus::BadDimensions;
+     }
+-    if (grid.h != spec.height || grid.w != spec.width || grid.cells == nullptr)
++    if (grid.h != spec.height || grid.w != spec.width || grid.bands != spec.bands || grid.cells == nullptr)
+     {
+         return CodecStatus::SizeMismatch;
+     }

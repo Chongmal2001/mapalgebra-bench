@@ -1,0 +1,28 @@
+# benchmark data: raw downloads, tile stores, references, outputs, results (large; never committed)
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Scala / sbt
+target/
+project/target/
+project/project/
+.bsp/
+.metals/
+.bloop/
+
+# IDEs (shared run configurations in /.run are committed)
+.idea/
+*.iml
+out/
+
+# OS
+.DS_Store

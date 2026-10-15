@@ -1,0 +1,105 @@
+{
+  "raster": {
+    "width": 61,
+    "height": 47,
+    "bands": 2,
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      -1.0,
+      47.0
+    ],
+    "crs": null
+  },
+  "tiling": {
+    "tile_size": 16,
+    "tiles_x": 4,
+    "tiles_y": 3,
+    "tile_order": "row-major",
+    "edge_padding": "nan"
+  },
+  "frames": [
+    {
+      "frame_id": 0,
+      "event_time_ms": 0,
+      "key": "frames/f000000.mpl",
+      "n_records": 12,
+      "nbytes": 49840,
+      "sha256": "87afe9ce0f1a14d59ab22949bebd73aa3ba7f132b9369ea5918ce77ec174e4f8",
+      "valid_cells": 4112,
+      "source": {
+        "frame": 0
+      }
+    },
+    {
+      "frame_id": 1,
+      "event_time_ms": 1000,
+      "key": "frames/f000001.mpl",
+      "n_records": 12,
+      "nbytes": 49840,
+      "sha256": "04f838947759151a74409dd59c98699d8f6c2eb2a946b2718f6a3782513864c7",
+      "valid_cells": 4089,
+      "source": {
+        "frame": 1
+      }
+    }
+  ],
+  "provenance": {
+    "source": {
+      "type": "synthetic",
+      "generator": "normal",
+      "params": {
+        "nodata_fraction": 0.2,
+        "nodata_block": [
+          10.0,
+          10.0,
+          20.0,
+          40.0
+        ]
+      },
+      "seed": 7,
+      "width": 61,
+      "height": 47,
+      "bands": 2,
+      "n_frames": 2
+    },
+    "tool": "mabench",
+    "version": "0.1.0",
+    "argv": [
+      "synth",
+      "--out",
+      "normal",
+      "--width",
+      "61",
+      "--height",
+      "47",
+      "--generator",
+      "normal",
+      "--bands",
+      "2",
+      "--frames",
+      "2",
+      "--seed",
+      "7",
+      "--param",
+      "nodata_fraction=0.2",
+      "--param",
+      "nodata_block=10,10,20,40",
+      "--tile-size",
+      "16"
+    ],
+    "created_utc": "2026-10-15T17:42:26+00:00"
+  },
+  "cells": {
+    "dtype": "float64",
+    "byte_order": "little",
+    "nodata": "nan",
+    "layout": "band-major; row-major within band",
+    "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)"
+  },
+  "format": "mabench-tilestore",
+  "format_version": 1,
+  "record_version": 3
+}

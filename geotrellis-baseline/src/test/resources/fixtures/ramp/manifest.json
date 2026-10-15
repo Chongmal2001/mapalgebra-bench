@@ -1,0 +1,86 @@
+{
+  "raster": {
+    "width": 50,
+    "height": 30,
+    "bands": 2,
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      -1.0,
+      30.0
+    ],
+    "crs": null
+  },
+  "tiling": {
+    "tile_size": 16,
+    "tiles_x": 4,
+    "tiles_y": 2,
+    "tile_order": "row-major",
+    "edge_padding": "nan"
+  },
+  "frames": [
+    {
+      "frame_id": 0,
+      "event_time_ms": 0,
+      "key": "frames/f000000.mpl",
+      "n_records": 8,
+      "nbytes": 33232,
+      "sha256": "dc78573a44d6f4ca03c955799b0935602974f8745d655c2808218e8f0e9f5868",
+      "valid_cells": 2950,
+      "source": {
+        "frame": 0
+      }
+    }
+  ],
+  "provenance": {
+    "source": {
+      "type": "synthetic",
+      "generator": "ramp",
+      "params": {
+        "nodata_block": [
+          0.0,
+          0.0,
+          5.0,
+          5.0
+        ]
+      },
+      "seed": 0,
+      "width": 50,
+      "height": 30,
+      "bands": 2,
+      "n_frames": 1
+    },
+    "tool": "mabench",
+    "version": "0.1.0",
+    "argv": [
+      "synth",
+      "--out",
+      "ramp",
+      "--width",
+      "50",
+      "--height",
+      "30",
+      "--generator",
+      "ramp",
+      "--bands",
+      "2",
+      "--param",
+      "nodata_block=0,0,5,5",
+      "--tile-size",
+      "16"
+    ],
+    "created_utc": "2026-10-15T17:42:26+00:00"
+  },
+  "cells": {
+    "dtype": "float64",
+    "byte_order": "little",
+    "nodata": "nan",
+    "layout": "band-major; row-major within band",
+    "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)"
+  },
+  "format": "mabench-tilestore",
+  "format_version": 1,
+  "record_version": 3
+}

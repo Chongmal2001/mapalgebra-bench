@@ -1,0 +1,75 @@
+{
+  "raster": {
+    "width": 61,
+    "height": 47,
+    "bands": 2,
+    "transform": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      -1.0,
+      47.0
+    ],
+    "crs": null
+  },
+  "tiling": {
+    "tile_size": 16,
+    "tiles_x": 4,
+    "tiles_y": 3,
+    "tile_order": "row-major",
+    "edge_padding": "nan"
+  },
+  "frames": [
+    {
+      "frame_id": 0,
+      "event_time_ms": 0,
+      "key": "frames/f000000.mpl",
+      "n_records": 12,
+      "nbytes": 49840,
+      "sha256": "1f4b7f7c481a3dec9fd8593687b74ec844bfbce1263a5a661b56de825bb9cbf3",
+      "valid_cells": 5734,
+      "source": {}
+    },
+    {
+      "frame_id": 1,
+      "event_time_ms": 1000,
+      "key": "frames/f000001.mpl",
+      "n_records": 12,
+      "nbytes": 49840,
+      "sha256": "0aa8b1eb9b168343a82e3209c0a76b148bec1dab16f82ada1cf9523149f03ac7",
+      "valid_cells": 5734,
+      "source": {}
+    }
+  ],
+  "provenance": {
+    "source": {
+      "type": "reference",
+      "input": "normal"
+    },
+    "role": "reference",
+    "workload": {
+      "family": "focal",
+      "output_kind": "raster",
+      "params": {
+        "op": "mean",
+        "shape": "square",
+        "radius": 20
+      }
+    },
+    "input_frames": {
+      "0": "87afe9ce0f1a14d59ab22949bebd73aa3ba7f132b9369ea5918ce77ec174e4f8",
+      "1": "04f838947759151a74409dd59c98699d8f6c2eb2a946b2718f6a3782513864c7"
+    }
+  },
+  "cells": {
+    "dtype": "float64",
+    "byte_order": "little",
+    "nodata": "nan",
+    "layout": "band-major; row-major within band",
+    "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)"
+  },
+  "format": "mabench-tilestore",
+  "format_version": 1,
+  "record_version": 3
+}
