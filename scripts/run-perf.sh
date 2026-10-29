@@ -9,10 +9,11 @@
 #
 # REPS (default 3), SYSTEMS (default "nes geotrellis"; also nes-passthrough, nes-running, nes-kahan), PERF_THREADS (NES worker threads, default 1),
 # GT_WARMUP (untimed GeoTrellis warm-up frames, default 1), GT_HEAP (sbt, default 4g), WINDOW_FRAMES (frames per tumbling
-# window, default 1; GeoTrellis then triggers per window instead of per frame).
+# window, default 1; GeoTrellis then triggers per window instead of per frame), GT_CPUSET (taskset cores for GeoTrellis,
+# default DOCKER_CPUSET, which pins NES).
 # Runs land in $DATA/perf/<store>/<workload>[-w<N>]/<system>-t<threads>/rep<k>/; finished runs are kept and skipped.
 set -euo pipefail
-[[ $# -eq 2 ]] || { sed -n '2,14p' "$0"; exit 2; }
+[[ $# -eq 2 ]] || { sed -n '2,15p' "$0"; exit 2; }
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 source "$REPO/scripts/nes/common.sh"
 DATA="$(realpath -m "$DATA")"
@@ -26,6 +27,8 @@ REPS="${REPS:-3}"
 SYSTEMS="${SYSTEMS:-nes geotrellis}"
 THREADS="${PERF_THREADS:-1}"
 GT_WARMUP="${GT_WARMUP:-1}"
+GT_CPUSET="${GT_CPUSET:-$DOCKER_CPUSET}"
+GT_PIN=(); if [[ -n "$GT_CPUSET" ]]; then GT_PIN=(taskset -c "$GT_CPUSET"); fi
 [[ -e "$STORE/manifest.json" ]] || { echo "error: $STORE is not a tile store" >&2; exit 1; }
 GT_WINDOW="--trigger frame"
 if [[ "$FPW" != 1 ]]; then
@@ -44,8 +47,8 @@ status=0
 for k in $(seq 1 "$REPS"); do
   for sys in $SYSTEMS; do
     case "$sys" in
-      nes|nes-passthrough|nes-running|nes-kahan) T="$THREADS"; BUILD="$NES_TYPE" ;;
-      geotrellis) T=1; BUILD="GT_HEAP=${GT_HEAP:-4g}" ;;
+      nes|nes-passthrough|nes-running|nes-kahan) T="$THREADS"; BUILD="$NES_TYPE"; CPUSET="$DOCKER_CPUSET" ;;
+      geotrellis) T=1; BUILD="GT_HEAP=${GT_HEAP:-4g}"; CPUSET="$GT_CPUSET" ;;
       *) echo "error: unknown system $sys" >&2; exit 2 ;;
     esac
     D="$PERF/$sys-t$T/rep$k"
@@ -62,14 +65,14 @@ for k in $(seq 1 "$REPS"); do
         status=1; continue
       fi
     else
-      if ! (cd "$REPO/geotrellis-baseline" && sbt -batch "run --mode microbatch --store $STORE --workload $WORKLOAD \
+      if ! (cd "$REPO/geotrellis-baseline" && "${GT_PIN[@]}" sbt -batch "run --mode microbatch --store $STORE --workload $WORKLOAD \
             --out $D --rate 0 $GT_WINDOW --output checksum --warmup $GT_WARMUP --no-verify") > "$D/gt.log" 2>&1; then
         tail -n 20 "$D/gt.log" >&2; status=1; continue
       fi
     fi
     cat > "$D/meta.json" <<EOF
 {"system": "$sys", "store": "$STORE", "workload": "$WORKLOAD", "threads": $T, "rep": $k, "frames_per_window": $FPW,
- "build": "$BUILD", "host": "$(hostname)", "started_utc": "$started"}
+ "build": "$BUILD", "cpuset": "$CPUSET", "host": "$(hostname)", "started_utc": "$started"}
 EOF
   done
 done

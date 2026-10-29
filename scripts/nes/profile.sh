@@ -7,6 +7,7 @@
 # Worker threads: PERF_THREADS (default 1, as in scripts/run-perf.sh).
 set -euo pipefail
 source "$(dirname "$0")/common.sh"
+[[ "$NES_NATIVE" != 1 ]] || { echo "error: profile.sh needs Docker (NES_NATIVE=1)" >&2; exit 2; }
 [[ $# -ge 2 ]] || { sed -n '2,7p' "$0"; exit 2; }
 PROFILE_IMAGE="${PROFILE_IMAGE:-${DOCKER_IMAGE%:*}:perf}"
 if ! docker image inspect "$PROFILE_IMAGE" > /dev/null 2>&1; then

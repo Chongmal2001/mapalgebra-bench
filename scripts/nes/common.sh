@@ -1,4 +1,4 @@
-# Sourced by scripts/nes/*.sh: settings from bench.env and the docker run prefix.
+# Sourced by scripts/nes/*.sh: settings from bench.env and the docker run prefix (native: runs on the host).
 BENCH_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_ENV="${BENCH_ENV:-$BENCH_REPO/bench.env}"
 [[ -f "$BENCH_ENV" ]] || { echo "error: $BENCH_ENV missing" >&2; exit 2; }
@@ -8,6 +8,10 @@ if [[ -f "$BENCH_REPO/bench.local.env" ]]; then source "$BENCH_REPO/bench.local.
 source "$BENCH_ENV"
 
 docker_run() {
+  if [[ "$NES_NATIVE" == 1 ]]; then
+    if [[ -n "$DOCKER_CPUSET" ]]; then taskset -c "$DOCKER_CPUSET" "$@"; else "$@"; fi
+    return
+  fi
   local args=(run --rm -i --init --user "$DOCKER_USER" -e HOME=/tmp -e XDG_STATE_HOME=/tmp/state --workdir "$NES_REPO")
   local d
   for d in "$NES_REPO" "$BENCH_REPO" "$DATA"; do

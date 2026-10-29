@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Runs one nes-cli topology in a fresh container (worker + query, then exit) and waits for the query to end.
+# NES_NATIVE=1: same on the host, binaries from NES_BUNDLE.
 #   scripts/nes/run-query.sh TOPOLOGY.yaml OUT_DIR
 # OUT_DIR gets status.json (final query status incl. started/stopped in µs), worker.log, cli.log, run.json,
 # worker_vmhwm (peak RSS of the worker). NES_PROFILE_SECS > 0 also samples the worker with perf (scripts/nes/profile.sh).
@@ -11,18 +12,30 @@ source "$(dirname "$0")/common.sh"
 TOPO="$(realpath "$1")"
 OUT="$(realpath -m "$2")"
 mkdir -p "$OUT"
-[[ -x "$NES_WORKER_BIN" && -x "$NES_CLI_BIN" ]] || { echo "error: NES binaries missing, run scripts/nes/build.sh" >&2; exit 2; }
+[[ -x "$NES_WORKER_BIN" && -x "$NES_CLI_BIN" ]] || { echo "error: NES binaries missing, run scripts/nes/build.sh (native: scripts/nes/bundle.sh)" >&2; exit 2; }
 grep -q 'localhost:8080' "$TOPO" || { echo "error: $TOPO must use worker localhost:8080" >&2; exit 2; }
 
+if [[ "$NES_NATIVE" == 1 ]]; then
+  # shellcheck disable=SC1091
+  source "$NES_BUNDLE/BUILD_INFO"
+  RUNTIME=native NES_COMMIT="$BUNDLE_NES_COMMIT" NES_DIRTY="$BUNDLE_NES_DIRTY" IMAGE="$BUNDLE_IMAGE" CTX=none
+  HOST_OS="$(. /etc/os-release && echo "$PRETTY_NAME")"
+else
+  RUNTIME=docker NES_COMMIT="$(git -C "$NES_REPO" rev-parse HEAD 2>/dev/null)"
+  NES_DIRTY=$( [[ -n "$(git -C "$NES_REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo true || echo false)
+  IMAGE="$(docker image inspect --format '{{.Id}}' "$DOCKER_IMAGE")"
+  CTX="$(docker context show 2>/dev/null)" HOST_OS="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"
+fi
 cat > "$OUT/run.json" <<EOF
 {
   "topology": "$TOPO",
-  "nes_commit": "$(git -C "$NES_REPO" rev-parse HEAD 2>/dev/null)",
-  "nes_dirty": $( [[ -n "$(git -C "$NES_REPO" status --porcelain 2>/dev/null)" ]] && echo true || echo false),
+  "runtime": "$RUNTIME",
+  "nes_commit": "$NES_COMMIT",
+  "nes_dirty": $NES_DIRTY,
   "bench_commit": "$(git -C "$BENCH_REPO" rev-parse HEAD 2>/dev/null)",
-  "image": "$(docker image inspect --format '{{.Id}}' "$DOCKER_IMAGE")",
-  "docker_context": "$(docker context show 2>/dev/null)",
-  "docker_host_os": "$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)",
+  "image": "$IMAGE",
+  "docker_context": "$CTX",
+  "docker_host_os": "$HOST_OS",
   "worker_bin": "$NES_WORKER_BIN",
   "pool_buffers": $NES_POOL_BUFFERS,
   "threads": $NES_THREADS,
@@ -39,6 +52,7 @@ EOF
 set +e
 docker_run bash -s <<EOF
 W='$NES_WORKER_BIN'; CLI='$NES_CLI_BIN'; OUT='$OUT'; TOPO='$TOPO'
+cd "\$OUT"
 "\$W" --grpc=localhost:8080 --data_address=localhost:9090 \
   --worker.number_of_buffers_in_global_buffer_manager=$NES_POOL_BUFFERS \
   --worker.query_engine.number_of_worker_threads=$NES_THREADS \
