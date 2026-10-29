@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 # Correctness matrix against the GeoTrellis full-grid reference (scripts/run-focal.sh per case), then a summary table.
 #   scripts/sweep-correctness.sh STORE [HALO_STORE]
-# Per op in OPS and radius in RADII: every summation mode (sum/mean: exact running kahan; min/max: exact), one frame per
-# window; at WINDOW_RADIUS additionally WINDOW_FRAMES frames per window. HALO_STORE (small tiles): every op and mode at
-# HALO_RADIUS, so the halo spans more than the 8 neighbouring tiles.
-# Defaults: OPS="sum mean min max" RADII="1 2 4 8 16" WINDOW_RADIUS=4 WINDOW_FRAMES=4 HALO_RADIUS=20 NES_THREADS=4.
+# Per shape in SHAPES, op in OPS and radius in RADII: every summation mode (square sum/mean: exact running kahan;
+# otherwise exact), one frame per window; at WINDOW_RADIUS additionally WINDOW_FRAMES frames per window. HALO_STORE
+# (small tiles): every shape, op and mode at HALO_RADIUS, so the halo spans more than the 8 neighbouring tiles.
+# Defaults: SHAPES="square circle" OPS="sum mean min max" RADII="1 2 4 8 16" WINDOW_RADIUS=4 WINDOW_FRAMES=4
+# HALO_RADIUS=20 NES_THREADS=4.
 # NES dumps and imported outputs are deleted after each compare; a reference is deleted after its last case
 # (KEEP_REFS=1 keeps them). Results: $DATA/results/<store>/*.json, *.png.
 set -euo pipefail
-[[ $# -ge 1 ]] || { sed -n '2,11p' "$0"; exit 2; }
+[[ $# -ge 1 ]] || { sed -n '2,12p' "$0"; exit 2; }
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 DATA="$(realpath -m "${DATA:-$REPO/data}")"
 export DATA NES_THREADS="${NES_THREADS:-4}" KEEP_DUMP=0 KEEP_OUTPUT=0
 STORE="$(realpath "$1")"
 HALO_STORE="${2:+$(realpath "$2")}"
+SHAPES="${SHAPES:-square circle}"
 OPS="${OPS:-sum mean min max}"
 RADII="${RADII:-1 2 4 8 16}"
 WINDOW_RADIUS="${WINDOW_RADIUS:-4}"
@@ -22,29 +24,31 @@ WIN="${WINDOW_FRAMES:-4}"
 HALO_RADIUS="${HALO_RADIUS:-20}"
 unset WINDOW_FRAMES
 
-modes() { case "$1" in sum|mean) echo "exact running kahan" ;; *) echo exact ;; esac; }
+modes() { if [[ "$1" == square && ( "$2" == sum || "$2" == mean ) ]]; then echo "exact running kahan"; else echo exact; fi; }
 status=0
-run_case() {  # store op radius frames-per-window
+run_case() {  # store shape op radius frames-per-window
   local m
-  for m in $(modes "$2"); do
-    echo "########## $(basename "$1") focal:$2:square:$3 summation=$m frames/window=$4"
-    NES_FOCAL_SUMMATION="$m" WINDOW_FRAMES="$4" scripts/run-focal.sh "$1" "focal:$2:square:$3" || status=1
+  for m in $(modes "$2" "$3"); do
+    echo "########## $(basename "$1") focal:$3:$2:$4 summation=$m frames/window=$5"
+    NES_FOCAL_SUMMATION="$m" WINDOW_FRAMES="$5" scripts/run-focal.sh "$1" "focal:$3:$2:$4" || status=1
   done
 }
-drop_ref() {  # store op radius
-  if [[ "${KEEP_REFS:-0}" == 0 ]]; then rm -rf "$DATA/refs/geotrellis/$(basename "$1")/$2-square-$3"; fi
+drop_ref() {  # store shape op radius
+  if [[ "${KEEP_REFS:-0}" == 0 ]]; then rm -rf "$DATA/refs/geotrellis/$(basename "$1")/$3-$2-$4"; fi
 }
 
-for op in $OPS; do
-  for r in $RADII; do
-    run_case "$STORE" "$op" "$r" 1
-    if [[ "$r" == "$WINDOW_RADIUS" ]]; then run_case "$STORE" "$op" "$r" "$WIN"; fi
-    drop_ref "$STORE" "$op" "$r"
+for shape in $SHAPES; do
+  for op in $OPS; do
+    for r in $RADII; do
+      run_case "$STORE" "$shape" "$op" "$r" 1
+      if [[ "$r" == "$WINDOW_RADIUS" ]]; then run_case "$STORE" "$shape" "$op" "$r" "$WIN"; fi
+      drop_ref "$STORE" "$shape" "$op" "$r"
+    done
+    if [[ -n "$HALO_STORE" ]]; then
+      run_case "$HALO_STORE" "$shape" "$op" "$HALO_RADIUS" 1
+      drop_ref "$HALO_STORE" "$shape" "$op" "$HALO_RADIUS"
+    fi
   done
-  if [[ -n "$HALO_STORE" ]]; then
-    run_case "$HALO_STORE" "$op" "$HALO_RADIUS" 1
-    drop_ref "$HALO_STORE" "$op" "$HALO_RADIUS"
-  fi
 done
 
 python - "$DATA/results" "$(basename "$STORE")" ${HALO_STORE:+"$(basename "$HALO_STORE")"} <<'PY'

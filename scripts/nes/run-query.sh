@@ -21,6 +21,8 @@ cat > "$OUT/run.json" <<EOF
   "nes_dirty": $( [[ -n "$(git -C "$NES_REPO" status --porcelain 2>/dev/null)" ]] && echo true || echo false),
   "bench_commit": "$(git -C "$BENCH_REPO" rev-parse HEAD 2>/dev/null)",
   "image": "$(docker image inspect --format '{{.Id}}' "$DOCKER_IMAGE")",
+  "docker_context": "$(docker context show 2>/dev/null)",
+  "docker_host_os": "$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)",
   "worker_bin": "$NES_WORKER_BIN",
   "pool_buffers": $NES_POOL_BUFFERS,
   "threads": $NES_THREADS,
