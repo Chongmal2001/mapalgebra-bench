@@ -40,11 +40,18 @@ class TileStore:
         backend = backend_for(location)
         return cls(backend, Manifest.load(backend))
 
-    def records(self, frame_id: int) -> Iterator[tuple[fmt.RecordHeader, np.ndarray]]:
-        """(header, cells) per tile. Cells are copies, safe to keep."""
+    def frame_header(self, frame_id: int) -> fmt.FrameHeader:
         buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
         try:
-            for header, cells in fmt.iter_records(buf):
+            return fmt.unpack_frame_header(buf)
+        finally:
+            _close(buf)
+
+    def records(self, frame_id: int) -> Iterator[tuple[fmt.MapletHeader, np.ndarray]]:
+        """(maplet header, cells) per tile, in file order. Cells are copies, safe to keep."""
+        buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
+        try:
+            for header, cells in fmt.iter_maplets(buf):
                 yield header, cells.copy()
         finally:
             _close(buf)
@@ -53,7 +60,7 @@ class TileStore:
         """(tile_x, tile_y) of every record, in file order, without copying any cells."""
         buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
         try:
-            return [(h.tile_x, h.tile_y) for h, _ in fmt.iter_records(buf)]
+            return [(h.tile_x, h.tile_y) for h, _ in fmt.iter_maplets(buf)]
         finally:
             _close(buf)
 
@@ -73,7 +80,7 @@ class TileStore:
         ty0, ty1 = row0 // s, (row1 - 1) // s
         buf = self.backend.read_buffer(m.frame(frame_id).key)
         try:
-            for h, cells in fmt.iter_records(buf):          # cells are views; only overlapping rows are copied
+            for h, cells in fmt.iter_maplets(buf):          # cells are views; only overlapping rows are copied
                 if not ty0 <= h.tile_y <= ty1:
                     continue
                 t0 = h.tile_y * s
@@ -84,10 +91,12 @@ class TileStore:
         return out[:, :, :W]
 
     def verify(self) -> VerifyReport:
-        """Checksums, record counts, tile grid completeness, header consistency, padding."""
+        """Checksums, frame header vs manifest, maplet headers, tile grid completeness, valid cells, padding."""
         m, report = self.manifest, VerifyReport()
         s, bands = m.tiling.tile_size, m.raster.bands
         expected_keys = {(x, y) for y in range(m.tiling.tiles_y) for x in range(m.tiling.tiles_x)}
+        epsg = fmt.crs_to_epsg(m.raster.crs)
+        transform = tuple(m.raster.transform) if m.raster.transform is not None else fmt.IDENTITY_TRANSFORM
         for info in m.frames:
             where = f"frame {info.frame_id}"
             if not self.backend.exists(info.key):
@@ -98,23 +107,29 @@ class TileStore:
                 if hashlib.sha256(buf).hexdigest() != info.sha256:
                     report.problems.append(f"{where}: sha256 mismatch")
                     continue
-                fid, n = fmt.unpack_frame_header(buf)
-                if fid != info.frame_id or n != info.n_records:
-                    report.problems.append(f"{where}: frame header ({fid}, {n}) disagrees with manifest")
+                fh = fmt.unpack_frame_header(buf)
+                got = (fh.frame_id, fh.n_tiles, fh.event_time_ms, fh.raster_width, fh.raster_height,
+                       fh.tile_width, fh.tile_height, fh.bands, fh.crs_epsg, fh.transform)
+                want = (info.frame_id, info.n_records, info.event_time_ms, m.raster.width, m.raster.height,
+                        s, s, bands, epsg, transform)
+                for name, g, w in zip(("frame_id", "n_tiles", "event_time_ms", "raster_width", "raster_height",
+                                       "tile_width", "tile_height", "bands", "crs_epsg", "transform"), got, want):
+                    if g != w:
+                        report.problems.append(f"{where}: frame header {name} {g} != manifest {w}")
                 seen, valid = set(), 0
-                for h, cells in fmt.iter_records(buf):
-                    if (h.frame_id, h.event_time_ms, h.bands, h.cols, h.rows) != (info.frame_id, info.event_time_ms, bands, s, s):
-                        report.problems.append(f"{where}: bad header at tile ({h.tile_x},{h.tile_y})")
+                for h, cells in fmt.iter_maplets(buf):
                     key = (h.tile_x, h.tile_y)
+                    if h.frame_id != 0:
+                        report.problems.append(f"{where}: maplet {key} has frame_id {h.frame_id}, files carry 0")
+                    if h.flags != 0:
+                        report.problems.append(f"{where}: maplet {key} has flags {h.flags:#x}")
                     if key in seen:
                         report.problems.append(f"{where}: duplicate tile {key}")
                     seen.add(key)
-                    vr = min(s, m.raster.height - h.tile_y * s)
-                    vc = min(s, m.raster.width - h.tile_x * s)
-                    if vr > 0 and vc > 0:
-                        valid += int(np.count_nonzero(~np.isnan(cells[:, :vr, :vc])))
+                    vr, vc = h.valid_rows, h.valid_cols
+                    valid += int(np.count_nonzero(~np.isnan(cells[:, :vr, :vc])))
                     padding = np.ones((s, s), bool)
-                    padding[:max(vr, 0), :max(vc, 0)] = False
+                    padding[:vr, :vc] = False
                     if not np.all(np.isnan(cells[:, padding])):
                         report.problems.append(f"{where}: padding of tile {key} is not NoData")
                 if seen != expected_keys:

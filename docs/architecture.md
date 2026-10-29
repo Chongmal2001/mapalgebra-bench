@@ -11,7 +11,12 @@ document covers the implementation.
  raw rasters ─ prepare ─►│ manifest.json   frames/f000000.mpl  frames/f000001.mpl  …                   │
  generator   ─ synth   ─►└───────┬───────────────────────┬───────────────────────────┬──────────────────┘
                                  │                       │                           │
-                     NES focal operator      geotrellis-baseline BatchRunner   mabench reference (oracle)
+              NES (RasterFile → FOCAL_* → File sink,     │                           │
+                   output format Binary)                 │                           │
+                                 │                       │                           │
+                     Binary dump ─ mabench import-nes    │                           │
+                                 │                       │                           │
+                                 │       geotrellis-baseline BatchRunner   mabench reference (oracle)
                                  │                       │                           │
                            output store            output store               reference store
                                  └───────────────┬───────┴───────────────────────────┘
@@ -24,27 +29,28 @@ document covers the implementation.
 - A **workload** (`focal:<op>:<shape>:<radius>`, or the same as `workload.json`) is the second input to every
   system. Output stores record it in their provenance, and `compare` refuses outputs of different workloads.
 
-## 2. Tile store format (record version 3)
+## 2. Tile store format (record version 4)
+
+The byte-level contract is `docs/maplet-format.md` section 5; this is the overview.
 
 ```
 <store>/manifest.json         raster (width, height, bands, transform, crs), tiling (tile_size, tiles_x, tiles_y),
                               cell layout, one entry per frame (key, n_records, nbytes, sha256, valid_cells), provenance
-<store>/frames/fNNNNNN.mpl    one file per frame
+<store>/frames/fNNNNNN.mpl    one file per frame = frame header + one maplet per tile
 ```
 
 | Part | Bytes | Layout (little-endian) |
 |---|---|---|
-| frame header | 16 | `char[8] "MPLFRM03"`, `u32 frame_id`, `u32 n_records` |
-| record header | 32 | `u64 event_time_ms`, `u32 frame_id`, `u16 bands`, `u16 flags`, `i32 tile_x`, `i32 tile_y`, `u32 cols`, `u32 rows` |
-| payload | 24 + 8·b·rows·cols | NES `MapletCodec` `WireFormat::Binary` blob: `u8 format=2`, `u8 cellType=1 (f64)`, `u8 bands`, pad, `u32 height`, `u32 width`, pad, `f64 noData=NaN`, then cells band-major, row-major within a band |
+| frame header | 112 | `char[8] "MPLFRM04"`, `u32 frame_id`, `u32 n_tiles`, `u64 event_time_ms`, `u32 raster_width`, `u32 raster_height`, `u32 tile_width`, `u32 tile_height`, `u8 bands`, `u8 cellType=1`, `u16 flags`, pad, `f64 noData=NaN`, `u32 crs_epsg`, pad, `f64[6] transform` |
+| maplet | 32 + 8·b·h·w | NES `MapletCodec` format 3: `u8 format=3`, `u8 cellType=1`, `u8 bands`, `u8 flags`, `u32 frame_id` (0 in files), `i32 tile_x`, `i32 tile_y`, `u32 height`, `u32 width`, `u32 raster_width`, `u32 raster_height`, then cells band-major, row-major within a band |
 
 Invariants:
 
-- **Self-describing records.** Every record states its own size, so a reader walks the file record by record.
-- **Fixed record size.** All tiles have the full `tile_size`, and edge tiles are padded with NaN, which `Raster::decode` requires. So record *i* also starts at the fixed offset `16 + i·R`.
-- **Fixed order.** Records are in row-major tile order (`tile_y`, then `tile_x`).
-- **NaN is NoData** everywhere, and the blob's `noData` field must be NaN.
-- **Frame files concatenate.** A file with several frames is just frame files concatenated in order.
+- **Raster-level facts once per frame.** Event time, raster size, tile size, band count, NoData, CRS and transform are in the frame header, nowhere else in the file. The manifest repeats the raster block, and readers check the two agree.
+- **Self-locating maplets.** Every maplet carries its position, its shape and the raster size, so NES can place and crop it without any other field. The frame id is 0 in files; the NES source assigns it.
+- **Fixed maplet size.** All tiles have the full `tile_size`, edge tiles are padded with NaN. Maplet *i* starts at `112 + i·(32 + 8·b·T·T)`.
+- **Fixed order.** Maplets are in row-major tile order (`tile_y`, then `tile_x`).
+- **NaN is NoData** everywhere; the frame header's `noData` must be NaN.
 
 ## 3. mabench (Python)
 
@@ -52,20 +58,21 @@ Invariants:
 
 | Module | Responsibility | Key behaviour |
 |---|---|---|
-| `format.py` | byte layout | `RecordHeader` (pack/unpack), `encode_blob` / `decode_blob` (validates format, cell type, bands, height, width and NaN noData exactly as `Raster::decode`), `iter_records` (yields header plus a zero-copy view of the cells; rejects trailing bytes) |
-| `manifest.py` | `manifest.json` | dataclasses `RasterInfo`, `TilingInfo`, `FrameInfo`, `Manifest`; `format_version 1`, `record_version 3` |
+| `format.py` | byte layout | `FrameHeader`, `MapletHeader` (pack/unpack with validation), `encode_maplet` / `decode_maplet`, `iter_maplets` (zero-copy cell views; checks every maplet against the frame header and the exact file length), `encode_frame`, `crs_to_epsg` |
+| `manifest.py` | `manifest.json` | dataclasses `RasterInfo`, `TilingInfo`, `FrameInfo`, `Manifest`; `format_version 1`, `record_version 4` |
 | `storage.py` | where bytes live | `StorageBackend`: `LocalBackend` (atomic writes via temp file + `os.replace`, mmap reads) and `FsspecBackend` (s3/gs/az/memory, for staging) |
 | `sources.py` | where frames come from | `RasterSource` → frames → `FrameReader.read(row, col, rows, cols)` returning float64 `(bands, rows, cols)` with NaN. `RasterioSource`: one file per frame; NoData masks → NaN; scale/offset applied; all files must share one grid. `SyntheticSource`: every value is a pure function of (seed, frame, band, y, x) (counter-based splitmix64), so any read order gives the same values. `ArraySource`: in-memory frames |
-| `tiler.py` | source → store | per frame: reads one strip (one tile row, full width), cuts it into NaN-padded tiles, streams header + blob to the frame file while computing SHA-256 and the valid-cell count; writes the manifest at the end |
-| `store.py` | reading stores | `records` (copies), `keys` (headers only), `assemble_rows(frame, row0, row1)` (decodes only tiles overlapping those rows), `assemble` (= all rows), `verify()` (checksums, header consistency, grid completeness, duplicates, NaN padding, valid-cell count) |
+| `tiler.py` | source → store | per frame: reads one strip (one tile row, full width), cuts it into NaN-padded tiles, streams frame header + maplets to the frame file while computing SHA-256 and the valid-cell count; writes the manifest at the end |
+| `store.py` | reading stores | `records` (copies), `keys` (headers only), `assemble_rows(frame, row0, row1)` (decodes only tiles overlapping those rows), `assemble` (= all rows), `frame_header`, `verify()` (checksums, frame header vs manifest, maplet headers, grid completeness, duplicates, NaN padding, valid-cell count) |
 | `oracle.py` | reference semantics | `focal(a, op, fp)` on an untiled 2-D array: sum/mean via zero-filled window sums plus an exact window count; min/max via ±inf-filled filters. Square footprints are summed separably (rows, then columns); circles use 2-D correlation. `naive_focal` is the literal per-cell definition used to test `focal` |
 | `workloads.py` | operator families | `Workload` base class with a registry; `FocalWorkload` (validate, reference, compare); `ZonalWorkload` (interface only: zones as a side input, table output) |
 | `compare.py` | correctness metrics | coverage, NoData confusion, exact and tolerance match, max abs error, RMSE, max ULP, per stratum; PASS/FAIL; JSON report; heatmap |
-| `cli.py` | commands | `prepare`, `synth`, `inspect`, `verify`, `workload`, `reference`, `compare` |
+| `nes_dump.py` | NES output | `index_dump` (header line, record framing, maplet preambles), `import_nes` (dump → output store, §3.5), `nes_query` (NES statements for a store and workload) |
+| `cli.py` | commands | `prepare`, `synth`, `inspect`, `verify`, `workload`, `reference`, `compare`, `nes-query`, `import-nes` |
 
 ### 3.2 `prepare`
 
-1. **Expand the inputs.** Glob patterns are expanded by mabench itself (so IDE run configurations work) and sorted by file name. File-name order is time order for GOES and MRMS.
+1. **Expand the inputs.** Glob patterns are expanded by mabench itself (so IDE run configurations work) and sorted by file name. File-name order is time order for dated files such as the S2 scenes.
 2. **Pick a variable from containers.** `--variable NAME` selects one variable from every container file: NetCDF, HDF5, HDF4, Zarr, i.e. anything GDAL exposes as subdatasets. The match is on the name after the last `:` or `/`. A wrong name lists the variables that exist; using it on a plain raster is an error.
 3. **Read with `RasterioSource`.** The first file fixes the grid (size, transform, CRS) and the bands (`--bands`, default all). Every later file must match it.
 4. **Tile.** The tiler writes one frame per file. Event times are `i × --frame-period-ms`.
@@ -102,7 +109,39 @@ PASS requires all of the following:
 - the NoData masks agree;
 - bitwise equality for min/max, or for sum/mean every cell within its tolerance.
 
-### 3.5 Memory and time (measured)
+### 3.5 `import-nes`
+
+Input: the file the NES File sink writes with output format `Binary` for the sink schema
+`(srcId UINT32, srcFrameId UINT32, ts UINT64, raster VARSIZED)`, all NOT NULL (`maplet-format.md` §8): the sink's schema
+line, then records `<IIQI` (srcId, srcFrameId, ts, len) + `len` maplet bytes, in emission order.
+
+1. **Index pass.** The first line must equal the schema line, field names compared case-insensitively because NES prints
+   unquoted identifiers upper-cased (anything else means a wrong sink schema, field order or output format). Every record is framed (truncation is reported with its offset), `len` must equal the input's
+   maplet size, and the preamble is checked (format 3, Float64, shape, raster size and position against the frame
+   header of the input frame named by `srcFrameId`; maplet `frame_id ≥ 1`). Only offsets and preambles are kept.
+2. **Grouping.** Records are grouped by the maplet `frame_id` (focal's output frame number). All records of a group must
+   share `srcFrameId` and `ts`, `ts` must equal the input frame's event time, and two output frames may not map to the
+   same input frame (sliding windows: the dump schema has no window bounds). `srcId` must be the same for all records,
+   or equal `--src-id`.
+3. **Writing.** Each group is written under the **input** frame id, so `compare` matches frames: the input frame header
+   with `n_tiles` = tiles present, then the maplets in row-major order with `frame_id 0` and `flags 0` (as `verify`
+   requires of every file), cells copied unchanged. Missing tiles are omitted (legal framing; `compare` reports them).
+   Identical duplicates are dropped, differing ones are an error. SHA-256, size and valid cells are computed while
+   writing; the manifest (raster and tiling copied from the input) is written last.
+4. **Provenance.** `role: nes`, the workload in mabench names, input frame checksums, and `nes`: dump path, srcId, record
+   count, `out_frame_of` (input frame → NES output frame), `filled_tiles` (maplets flagged FILLED), `missing_tiles`,
+   `duplicates_dropped`, `padding_not_nodata` (edge tiles whose padding is not NaN; kept as written, `compare` ignores
+   padding, `verify` reports it), `frames_without_output`.
+
+Memory is proportional to the number of records; cells are read from the dump one maplet at a time in the second pass.
+
+`nes-query` prints matching NES statements: a RasterFile source on the store, one frame per tumbling window (size = the
+smallest event-time step between frames), the nine positional `FOCAL_*` arguments from the manifest (`SQUARE` / `DISC`,
+`FOCAL_SUM|MEAN|MIN|MAX`), and the File sink with output format `Binary` and the dump schema; SQL for
+`nes-repl-embedded` by default, a one-worker `nes-cli` topology file with `--yaml` (`--store-path` if the worker sees the
+store under another path, e.g. in a container).
+
+### 3.6 Memory and time (measured)
 
 | Command | Memory | Measured |
 |---|---|---|
@@ -120,10 +159,10 @@ Package `de.tuberlin.dima.geotrellisbaseline`; GeoTrellis 3.8.1 (`geotrellis-ras
 
 | File | Responsibility |
 |---|---|
-| `tilestore/Format.scala` | the byte layout: frame header, record header, `readBlob` / `writeBlob` (same validation as `Raster::decode`), `Record(header, cells)` with `band(b)`. No dependencies |
-| `tilestore/FrameFile.scala` | streaming frame reader (`FileChannel`, record by record; no 2 GiB mmap limit) and writer (atomic temp file + rename, SHA-256 and valid-cell count while writing). `write(path, id, n, iterator, …)` streams records and checks that exactly `n` were written |
+| `tilestore/Format.scala` | the byte layout: `FrameHeader`, `MapletHeader`, read/write of both, `checkMaplet`, `Record(header, cells)` with `band(b)`. No dependencies |
+| `tilestore/FrameFile.scala` | streaming frame reader (`FileChannel`, record by record; no 2 GiB mmap limit) and writer (atomic temp file + rename, SHA-256 and valid-cell count while writing). `write(path, frameHeader, iterator)` streams maplets and checks that exactly `n_tiles` were written; `readHeader` reads the 112-byte header alone |
 | `tilestore/Manifest.scala` | `manifest.json` via circe; fails fast on any other record version, byte order, dtype or NoData convention |
-| `tilestore/TileStore.scala` | open a store, `verifyChecksums`, `readFrame` (checks headers against the manifest), `maskPadding`; `TileStoreWriter` writes an output store with the input's raster and tiling |
+| `tilestore/TileStore.scala` | open a store, `verifyChecksums`, `readFrame` (frame header against the manifest, no duplicate positions), `maskPadding`; `TileStoreWriter` writes an output store whose frame headers are copies of the input's |
 | `focal/FocalWorkload.scala` | workload JSON or short form → GeoTrellis `Square(r)` / `Circle(r)` plus kernel `Mean` / `Sum` / `Min` / `Max` with `TargetCell.All` |
 | `focal/FocalEngine.scala` | one window = one frame: `prepare` → `compute` → `toRecords` |
 | `runner/BatchRunner.scala` | CLI: `--store --workload --out [--no-verify]`; heap check; runs all frames; writes output store and `timings.csv` |
@@ -170,27 +209,20 @@ not something to optimise away. A streaming focal operator needs about two tile 
   - Mean and Sum on squares use running sums (add the new column, subtract the old one), so rounding drift along long rows is possible.
   - Circles use a cursor that tracks cells entering and leaving the mask.
   - Min and Max visit every cell of the window for each output cell.
-- **Halo limit.** Halos come only from the **8 direct neighbours**, cropped to the neighbour's size. For r > tile size, cells further away are silently missing from the window; `BaselineSuite` tests this at r = 20 on 16-px tiles.
+- **Halo limit.** Halos come only from the **8 direct neighbours**, cropped to the neighbour's size. For r > tile size, cells further away are silently missing from the window.
 
-## 5. nes/
-
-- **`MapletCodec.cpp.patch` / `MapletCodec.cpp`.** Multiband support: the band count goes in preamble byte 2, and single-band blobs are byte-identical to before. The required header changes are listed in `nes/README.md`.
-- **`tests/MapletCodecGoldenTest.cpp`.** A gtest with 1- and 2-band golden blobs: decode, byte-identical encode, a zero-noData spec rejected. The same bytes are checked against mabench's encoder in `mabench/tests/test_pipeline.py`.
-- **`tests/crosscheck.cpp`.** Decodes and re-encodes every record of a real frame file with the NES codec and requires identical bytes.
-
-## 6. Verification matrix
+## 5. Verification matrix
 
 | What | How |
 |---|---|
-| mabench blobs = NES codec | golden test (C++), golden sync test (Python), `crosscheck` on whole frames |
-| GeoTrellis tile I/O = mabench | `FormatSuite`: re-written frames have the same SHA-256 as mabench's |
-| GeoTrellis fixtures = current mabench | `test_fixtures.py` regenerates every fixture and compares frame hashes |
+| mabench store = NES codec | the NES RasterFile source reads mabench stores; NES output imported by `import-nes` and compared bit for bit (S2) |
+| `import-nes` | synthetic dumps built from oracle outputs of small stores generated at test time (shuffled, missing tile, identical and differing duplicates, FILLED, bad header line, truncation, inconsistent lineage): clean dumps reproduce the reference frame files byte for byte and `compare` PASSes; faults are reported or rejected |
+| GeoTrellis tile I/O = mabench | `FormatSuite`: byte offsets per maplet-format.md §5; re-written fixture frames have the same SHA-256 as mabench's |
 | oracle = spec | `naive_focal` comparison, all-NoData windows, tile-size invariance |
 | strip processing = whole-frame processing | reference bit-identical; stratum masks identical; `assemble_rows` = slices of `assemble` |
-| GeoTrellis = oracle (small) | `BaselineSuite`: six workloads; halo-defect hypothesis at r > tile size |
 | compare logic | identical, within-tolerance, ULP, missing tiles, NoData mismatches, stratum attribution, one-tile-halo model |
 
-## 7. Known limits and next steps
+## 6. Known limits and next steps
 
 - **No frame selection or resume.** Output manifests are written after the last frame, so an interrupted run has to start over.
 - **`compare` is single-threaded** and parses every record header for each strip. It could jump to fixed offsets and compare frames in parallel.

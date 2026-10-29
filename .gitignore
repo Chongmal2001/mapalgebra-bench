@@ -26,3 +26,9 @@ out/
 
 # OS
 .DS_Store
+
+# per-machine overrides of bench.env (bench.env itself is committed)
+bench.local.env
+
+# logs of sweeps run from the repository root
+*.log

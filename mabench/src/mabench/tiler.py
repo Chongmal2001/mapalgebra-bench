@@ -1,4 +1,7 @@
-"""Cut a raster source into fixed-size tiles and write a tile store.
+"""Cut a raster source into fixed-size tiles and write a tile store (record version 4).
+
+Each frame file is one frame header (raster-level facts, event time, NoData) followed by one self-locating
+maplet per tile, row-major; maplet ``frame_id`` is 0 (unassigned) because the NES source numbers frames.
 
 Reads one strip of tile rows at a time, so memory stays at roughly
 ``width * tile_size * bands * 8`` bytes regardless of raster size.
@@ -33,6 +36,8 @@ def tile_source(source: RasterSource, backend: StorageBackend, tile_size: int,
     tiles_x, tiles_y = math.ceil(g.width / tile_size), math.ceil(g.height / tile_size)
     n_records = tiles_x * tiles_y
     frames: list[FrameInfo] = []
+    crs_epsg = fmt.crs_to_epsg(g.crs)
+    transform = tuple(g.transform) if g.transform is not None else fmt.IDENTITY_TRANSFORM
 
     for frame in source.frames():
         key = frame_key(frame.frame_id)
@@ -44,7 +49,9 @@ def tile_source(source: RasterSource, backend: StorageBackend, tile_size: int,
                 digest.update(chunk)
                 nbytes += len(chunk)
 
-            emit(fmt.pack_frame_header(frame.frame_id, n_records))
+            header = fmt.FrameHeader(frame.frame_id, n_records, frame.event_time_ms, g.width, g.height,
+                                     tile_size, tile_size, g.bands, crs_epsg, transform)
+            emit(header.pack())
             for ty in range(tiles_y):
                 row0 = ty * tile_size
                 nrows = min(tile_size, g.height - row0)
@@ -57,10 +64,7 @@ def tile_source(source: RasterSource, backend: StorageBackend, tile_size: int,
                     ncols = min(tile_size, g.width - col0)
                     tile = np.full((g.bands, tile_size, tile_size), np.nan, dtype=fmt.CELL_DTYPE)
                     tile[:, :nrows, :ncols] = strip[:, :, col0:col0 + ncols]
-                    header = fmt.RecordHeader(frame.event_time_ms, frame.frame_id, g.bands, 0,
-                                              tx, ty, tile_size, tile_size)
-                    emit(header.pack())
-                    emit(fmt.encode_blob(tile))
+                    emit(fmt.encode_maplet(header.maplet_header(tx, ty), tile))   # frame_id 0: NES assigns it
         frames.append(FrameInfo(frame.frame_id, frame.event_time_ms, key, n_records, nbytes,
                                 digest.hexdigest(), valid, frame.description))
         if progress:

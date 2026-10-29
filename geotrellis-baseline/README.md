@@ -1,80 +1,81 @@
 # geotrellis-baseline
 
-GeoTrellis 3.8.1 baseline for *Streaming Map Algebra: Windowed Raster Processing in NebulaStream*.
-It reads the same tile stores as NES (written by `mabench`), runs a focal workload with GeoTrellis'
-standard layer-level focal path, and writes the result as a tile store, so `mabench` can compare it
-with the oracle and with NES.
+GeoTrellis 3.8.1 baselines for *Streaming Map Algebra: Windowed Raster Processing in NebulaStream*. Reads the same
+tile stores as NES (written by mabench) and writes results as tile stores, so `mabench compare` can line them up.
 
-```
-mabench prepare/synth ──► tile store ──► BatchRunner (GeoTrellis) ──► output tile store + timings.csv
-                                    └──► mabench reference (oracle) ──► reference tile store
-```
+| Mode | Role | What it runs |
+|---|---|---|
+| `fullgrid` | correctness reference | each frame and band as one untiled `DoubleArrayTile`, focal operation on the whole grid: no tiles, no halos |
+| `tiled` | compute core of the micro-batch baseline | each frame as a tiled layer, `CollectionFocalOperation` (halos from the 8 neighbouring tiles) |
+| `microbatch` | performance baseline | frames replayed at a rate into event-time tumbling windows, each frame a tiled layer as in `tiled`; latency, throughput, peak heap |
 
-## Build and test
+## Build, test, run
 
 Requires JDK 17 or 21 and sbt 1.10+.
 
 ```bash
-sbt test      # FormatSuite + BaselineSuite against mabench fixtures in src/test/resources/fixtures
+cd geotrellis-baseline
+sbt test        # FormatSuite (tile store I/O vs mabench), FullGridSuite (full grid vs the focal definition), MicroBatchSuite
+
+sbt "run --mode fullgrid --store ../data/stores/s2-berlin --workload focal:mean:square:3 --out ../data/refs/geotrellis/s2-berlin/mean-square-3"
+mabench verify ../data/refs/geotrellis/s2-berlin/mean-square-3
 ```
 
-`BaselineSuite` is the first correctness comparison:
-- **Six workloads** (mean, sum, min and max on square r = 2; mean and max on circle r = 3) must match the oracle on a 2-band, 2-frame store with 20 % NoData and a NoData block. Min and max must match exactly; sum and mean within 1e-9 relative.
-- **One hypothesis test** checks the halo defect from `baseline-design.md` §2.1 at r = 20 with tile size 16. If it fails, GeoTrellis handles r > tile size correctly, and that finding must be dropped.
-
-## Run
+## Micro-batch
 
 ```bash
-mabench synth --out stores/syn --width 2048 --height 2048 --generator normal --bands 2 \
-              --param nodata_fraction=0.1 --frames 2 --tile-size 256
-mabench workload focal:mean:square:3 -o workloads/mean-sq-3.json
-mabench reference stores/syn --workload workloads/mean-sq-3.json --out refs/syn/mean-sq-3
-
-sbt "run --store stores/syn --workload workloads/mean-sq-3.json --out out/gt/syn/mean-sq-3"
-mabench verify out/gt/syn/mean-sq-3      # the GeoTrellis output is a valid tile store
+sbt "run --mode microbatch --store ../data/stores/s2-berlin --workload focal:mean:square:3 --out ../data/runs/gt-mb/s2-berlin \
+         --window-ms 432000000 --rate 0.5 --trigger frame --output checksum --warmup 2"
 ```
 
-`--workload` also accepts the short form `focal:mean:square:3`. `--no-verify` skips the input checksum pass.
-`run` forks a JVM with a fixed heap, 4 GiB by default. Set `GT_HEAP` for large frames, e.g.
-`GT_HEAP=20g sbt "run …"`: GeoTrellis holds a whole frame (one window) at once and needs about 4× its size.
-The runner prints the largest frame, the heap and the estimate at startup, and stops before reading anything
-if the heap is too small. Progress lines go to stderr; `build.sbt` forwards them without sbt's `[error]` prefix.
+Mirrors a NES query `WINDOW TUMBLING(ts, size <window-ms> ms)` on the same store:
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--window-ms N` | event-time tumbling window size | smallest event-time step between frames (one frame per window) |
+| `--rate FPS` | frames arrive every 1/FPS s, complete; `0` = all available at once (maximum throughput) | `0` |
+| `--trigger frame` | compute each frame when it arrives (as NES emits a frame on completeness) | `frame` |
+| `--trigger window` | compute all frames of a window when it closes (a frame of a later window arrives, or the stream ends) | |
+| `--output checksum` / `store` | sum of output cells (timed runs, no output I/O) / tile store (to compare with the full-grid reference) | `checksum` |
+| `--warmup N` | compute the first N frames once before timing | `0` |
+
+Frames never arrive incomplete, so there is no partial-frame path. Latency of a batch = end of its computation minus the
+scheduled arrival of its last frame, so reading the frame from disk and waiting behind earlier batches count, as in NES
+where the source reads inside the query. Output: `batches.csv` (one row per batch: window, frames, tiles, arrival, start,
+done, latency, queueing, compute time) and `summary.json` (parameters, wall time, throughput in cells/s, latency
+p50/p95/p99/max, peak heap, checksum). Heap need: (frames held + 3) × the largest frame; with `--trigger window` all
+frames of a window are held.
+
+## Options
+
+`--workload` takes a `workload.json` (`mabench workload`) or the short form. `--no-verify` skips the input checksum pass.
+Output: a tile store with the input's raster, tiling and frame headers, provenance (`role`, `mode`, workload), and
+`timings.csv` (compute time per frame, indicative only). `scripts/run-focal.sh` calls the full-grid mode as reference.
+
+**Heap.** `run` forks a JVM with `-Xms = -Xmx = GT_HEAP` (default `4g`). The runner prints the largest frame and the
+estimated need (4× the frame) and stops before reading if the heap is too small. One S2 frame (3801 × 3088, 4 bands,
+≈ 390 MB) needs ≈ 1.6 GB, so the full S2 dataset runs in 4 GB; frames are processed one after another.
+
+## Semantics
+
+Kept aligned with NES and the evaluation spec:
+
+- **NoData.** Tiles are `DoubleConstantNoDataCellType`, so NaN is NoData; NoData cells are skipped and an
+  all-NoData window gives NaN. Missing input tiles are NoData in the assembled full grid.
+- **Edges.** The window is truncated at the raster edge.
+- **Neighbourhoods.** `Square(r)`; `Circle(r)` includes cells at distance ≤ r. `TargetCell.All`.
+- **Multiband.** Bands are processed one after another.
+- **Numerics.** Mean and Sum on squares use running sums: bit-identical on integer-valued data, last-bit differences
+  on fractional data (covered by the τ tolerance in `mabench compare`). Min and Max are exact.
+- **Tiled mode, r > tile size.** Halos come only from the 8 adjacent tiles, so cells further away are missing.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `tilestore/Format.scala` | byte layout (record version 3), reading/writing headers and MapletCodec blobs; no dependencies |
-| `tilestore/FrameFile.scala` | streaming frame reader/writer (no 2 GiB mmap limit), SHA-256, valid-cell count; no dependencies |
-| `tilestore/Manifest.scala` | `manifest.json` via circe (transitive through GeoTrellis); fails fast on any other record version, byte order, dtype or nodata |
-| `tilestore/TileStore.scala` | open, verify checksums, read frames, mask padding, write output stores |
-| `focal/FocalWorkload.scala` | `workload.json` → GeoTrellis neighbourhood and kernel (`Mean`, `Sum`, `Min`, `Max`; `Square`, `Circle`) |
-| `focal/FocalEngine.scala` | one window: `prepare` (untimed) → `compute` (timed) → `toRecords` (untimed) |
-| `runner/BatchRunner.scala` | correctness baseline over all frames; writes output store + `timings.csv` |
-
-## Semantics and fairness notes
-
-- **Cell type.** Tiles are `DoubleArrayTile` with `DoubleConstantNoDataCellType`, so NaN is NoData, as in the store and in NES.
-- **Neighbour assembly.** It goes through `CollectionFocalOperation` (`bufferTiles` + kernel on the buffered tile). It is inside the timed region, like halo resolution in NES.
-- **Multiband.** GeoTrellis focal operations are single-band, so bands are processed one after another. This is also how its `MultibandTile` focal methods work.
-- **Padding.** Output padding (cells outside the raster extent) is reset to NaN, so outputs pass `mabench verify` and compare cell for cell with the oracle.
-- **Lazy results in Scala 2.12.** `CollectionFocalOperation` returns a lazily evaluated `Stream`: `BufferTiles` ends in `groupBy(...).mapValues(...).toSeq`. `FocalEngine.compute` forces it with `toVector`. Without that, the kernels would run after the timer stops and timings would be meaningless.
-- **Timings.** `timings.csv` from `BatchRunner` is indicative only (no warm-up control). Performance numbers come from the micro-batch driver and JMH benchmarks (next steps).
-
-## What has been verified, and how
-
-- **Tile store core** (`Format`, `FrameFile`). Compiled with Scala 2.12.18 (no warnings under `-Xlint`) and run against the mabench fixtures:
-  - blob bytes identical to the MapletCodec golden blob;
-  - ramp values and padding cell-exact;
-  - both frames of the `normal` store re-written byte-identically (same SHA-256 and valid-cell count as mabench);
-  - truncated and wrong-version frames rejected.
-- **GeoTrellis and circe code.** Every call was checked against the GeoTrellis 3.8.1 source. It compiles and runs with sbt 1.10.7 on JDK 21; a GOES-19 C02 frame (21696², 3.53 GiB, 7225 tiles) ran with `GT_HEAP=17g` in 9.8 s of timed compute (`focal:mean:square:3`).
-- **Fixtures** are mabench output; `mabench/tests/test_fixtures.py` regenerates them and fails if any frame differs from the committed copy. Regenerate with `scripts/regen-fixtures.sh` after a deliberate format change.
-
-## Memory
-
-Per frame, the runner keeps: the input layer (single band wraps the decoded arrays, no copy), GeoTrellis'
-buffered tiles, and the result layer. Input records are dropped after `prepare`, and output records are
-produced lazily and streamed to disk one at a time (`FrameFile.write` with a record count and an iterator),
-so peak heap is about 3-4× the frame. Frames run one after another, so the frame count does not matter,
-only the largest frame.
+| `tilestore/` | `Format` (record version 4 byte layout), `FrameFile` (streaming frame reader/writer, SHA-256), `Manifest` (`manifest.json`, fails fast on other versions), `TileStore` (read, verify, write output stores) |
+| `focal/FocalWorkload.scala` | workload → GeoTrellis neighbourhood and kernel |
+| `focal/FullGrid.scala` | assemble frame → one tile per band → kernel → cut back into tiles |
+| `focal/FocalEngine.scala` | tiled layer, `CollectionFocalOperation` (lazy result forced inside the timed region) |
+| `runner/Main.scala` | command line, `--mode`, heap check, provenance and `timings.csv` |
+| `runner/FullGridRunner.scala`, `runner/BatchRunner.scala`, `runner/MicroBatchRunner.scala` | the `fullgrid`, `tiled` and `microbatch` modes |

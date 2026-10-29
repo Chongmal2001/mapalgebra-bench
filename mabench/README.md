@@ -5,7 +5,7 @@ Entry point of the baseline pipeline: it cuts a raster into tiles once and write
 that NES and the GeoTrellis micro-batch job both read. It also computes the reference (oracle) result.
 
 ```
-raster file(s) / generator ──► mabench prepare|synth ──► tile store ──┬─► NES query
+raster file(s) / generator ──► mabench prepare|synth ──► tile store ──┬─► NES query ─► Binary dump ─► mabench import-nes
                                                                       ├─► GeoTrellis micro-batch
                                                                       └─► mabench reference (oracle)
 ```
@@ -15,7 +15,7 @@ raster file(s) / generator ──► mabench prepare|synth ──► tile store 
 ```bash
 pip install -e ".[dev]"      # numpy, scipy, rasterio; pytest + fsspec for tests
 pip install -e ".[blob]" s3fs   # only if a store should live in object storage
-pytest                        # 49 tests
+pytest
 ```
 
 ## Usage
@@ -44,7 +44,21 @@ mabench reference stores/dem-256 --workload workloads/mean-sq-3.json --out refs/
 # correctness of a system's output (NES or GeoTrellis) against the oracle; exit code 1 on FAIL
 mabench compare out/gt/dem-256/mean-sq-3 --reference refs/dem-256/mean-sq-3 --input stores/dem-256 \
                 --json results/gt-mean-sq-3.json --heatmap results/gt-mean-sq-3.png
+
+# NES: print the statements that run the workload and write a Binary dump, run them in NES, import the dump
+mabench nes-query stores/dem-256 --workload focal:mean:square:3 --dump /abs/path/dump.bin --yaml > dump.yaml
+nes-cli -t dump.yaml start          # needs nes-single-node-worker --grpc=localhost:8080 --data_address=localhost:9090
+mabench import-nes /abs/path/dump.bin --input stores/dem-256 --workload focal:mean:square:3 --out out/nes/dem-256/mean-sq-3
+mabench compare out/nes/dem-256/mean-sq-3 --reference refs/dem-256/mean-sq-3 --input stores/dem-256
 ```
+
+`import-nes` reads the file the NES File sink writes with output format `Binary` for the sink schema
+`(srcId UINT32, srcFrameId UINT32, ts UINT64, raster VARSIZED)`, all NOT NULL (`docs/maplet-format.md` §8). It groups
+records by the maplet's `frame_id` (focal's output frame), maps each group through `srcFrameId` to the input frame
+(`ts` must equal that frame's event time), places the maplets by tile position and writes an output store on the
+input's raster and tiling. Tiles missing from the dump are omitted (`compare` reports them); identical duplicates are
+dropped, differing ones are an error; the FILLED flag and all of this go to `provenance.nes`. See
+`docs/architecture.md` §3.5.
 
 `compare` implements evaluation-spec §3.2:
 - **Coverage.** Every tile is present exactly once.
@@ -80,65 +94,23 @@ event-time order, and keeps object sizes reasonable in blob storage. A single-st
 source that wants one is simply the concatenation of the frame files in order, since each record
 is self-describing.
 
-### Frame file (record version 3)
+### Frame file and manifest (record version 4)
 
-| Part | Layout |
-|---|---|
-| Frame header, 16 B | `char[8] magic = "MPLFRM03"`, `u32 frame_id`, `u32 n_records` |
-| Record header, 32 B | `u64 event_time_ms`, `u32 frame_id`, `u16 bands`, `u16 flags (0)`, `i32 tile_x`, `i32 tile_y`, `u32 cols`, `u32 rows` — the scalar fields of the NES tuple |
-| Payload | exactly one NES `MapletCodec` `WireFormat::Binary` blob, passed to `Raster::decode` unchanged |
+A frame file is a 112-byte frame header (`MPLFRM04`: frame id, tile count, event time, raster and tile size, bands,
+NoData = NaN, CRS EPSG, transform) followed by one NES `MapletCodec` format-3 maplet per tile in row-major order: a
+32-byte self-locating preamble (format 3, cellType, bands, flags, `frame_id` = 0 in files, tile_x, tile_y, height,
+width, raster width and height) plus float64 cells, band-major. Edge tiles are padded to the full tile size with NaN.
+The manifest (`record_version: 4`) holds the raster block, the tiling, one entry per frame (key, tile count, size,
+SHA-256, valid cells) and the provenance; readers fail fast on any other record version.
 
-MapletCodec binary blob (from `MapletCodec.cpp`):
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 1 | format = 2 (`WireFormat::Binary`) |
-| 1 | 1 | cell type = 1 (`CellType::Float64`) |
-| 2 | 1 | bands (1..255), all bands of the tile |
-| 3 | 1 | reserved, 0 |
-| 4 | 4 | `u32` height (rows), **height before width** |
-| 8 | 4 | `u32` width (cols) |
-| 12 | 4 | reserved, 0 |
-| 16 | 8 | `f64` noData sentinel, **NaN** in every benchmark store |
-| 24 | 8·b·h·w | `f64` cells, band-major, row-major within a band, little-endian |
-
-All integers are little-endian, and every offset is a multiple of 8, so readers can view cells in place.
-Records are in row-major tile order (`tile_y`, then `tile_x`).
-
-`Raster::decode` rejects a blob whose bands, height, width or noData differ from the stream's `TileSpec`. Two consequences:
-- **Edge tiles must be padded.** Every tile has the full `tile_size`, and partial edge tiles are padded with NaN. This does not change any result under truncate-edge, NoData-ignoring semantics. `manifest.raster.width/height` give the true extent.
-- **The NES `TileSpec` must set `format = Binary`, `bands = manifest.raster.bands` and `noData = NaN`.** The default `noData = 0.0` makes `decode` reject these blobs (`SizeMismatch`). It would also turn every genuine 0.0 into NoData.
-
-All selected bands of a tile go into one maplet, band-major. Multiband needs the codec patch in `../nes/`; single-band blobs are unchanged by it.
-
-**Cross-checked against the real codec.**
-- `../nes/tests/MapletCodecGoldenTest.cpp` is a gtest with an embedded golden blob. It checks that `decode` reads it, that `encode` reproduces it byte for byte, and that a zero-noData spec is rejected. It has 1-band and 2-band golden blobs. It passes against the patched `MapletCodec.cpp` in `../nes/` and is meant to live next to the codec's unit tests in NES.
-- A Python test keeps the embedded golden blob in sync with `encode_blob`.
-- `../nes/tests/crosscheck.cpp` walks a whole frame file. It decodes each payload with `Raster::decode`, re-encodes it with `Raster::encode`, and requires identical bytes:
-
-  `g++ -std=c++20 -I<RasterFunctions> MapletCodec.cpp nes/tests/crosscheck.cpp -o crosscheck && ./crosscheck store/frames/f000000.mpl`
-
+Byte tables: `../docs/architecture.md` §2 (overview) and `../docs/maplet-format.md` §5 (contract).
 `src/mabench/format.py` is the single source of truth for this layout on the Python side.
-
-### Manifest (abridged)
-
-```json
-{
-  "format": "mabench-tilestore", "format_version": 1, "record_version": 3,
-  "raster": {"width": 8192, "height": 8192, "bands": 1, "transform": [a, b, c, d, e, f], "crs": "EPSG:4326"},
-  "tiling": {"tile_size": 256, "tiles_x": 32, "tiles_y": 32, "tile_order": "row-major", "edge_padding": "nan"},
-  "cells":  {"dtype": "float64", "byte_order": "little", "nodata": "nan", "layout": "band-major; row-major within band", "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)"},
-  "frames": [{"frame_id": 0, "event_time_ms": 0, "key": "frames/f000000.mpl", "n_records": 1024,
-              "nbytes": 536928272, "sha256": "…", "valid_cells": 67108864, "source": {"file": "dem.tif"}}],
-  "provenance": {"source": {…}, "tool": "mabench", "version": "0.1.0", "argv": […], "created_utc": "…"}
-}
-```
 
 ## Design
 
 | Module | Responsibility |
 |---|---|
-| `format.py` | byte layout; payload = NES `MapletCodec` binary blob (shared contract with NES and GeoTrellis `MapletIO`) |
+| `format.py` | byte layout: frame header + NES `MapletCodec` format-3 maplets (shared contract with NES and GeoTrellis `Format.scala`) |
 | `manifest.py` | raster-level invariants, tiling, per-frame checksums and provenance |
 | `storage.py` | `StorageBackend`: `LocalBackend` (atomic writes, mmap reads) and `FsspecBackend` (S3/GCS/Azure) |
 | `sources.py` | `RasterSource`: `RasterioSource` (one file per frame), `SyntheticSource`, `ArraySource` |
@@ -147,6 +119,7 @@ All selected bands of a tile go into one maplet, band-major. Multiband needs the
 | `oracle.py` | untiled reference for focal semantics, plus the naive per-cell definition it is tested against |
 | `compare.py` | stratified correctness metrics, pass/fail verdict, JSON report, error heatmap |
 | `workloads.py` | `Workload` base class; `FocalWorkload` (implemented), `ZonalWorkload` (interface only) |
+| `nes_dump.py` | NES `Binary` dump → output store (`import-nes`); NES statements for a store and workload (`nes-query`) |
 
 **Workloads.** Each operator family is a `Workload` subclass that declares its parameters, its
 `output_kind` (`RASTER` for focal, `TABLE` for zonal), its static `side_inputs()`, a

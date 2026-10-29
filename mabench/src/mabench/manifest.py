@@ -58,7 +58,7 @@ class Manifest:
     cells: dict[str, str] = field(default_factory=lambda: {
         "dtype": "float64", "byte_order": "little", "nodata": "nan",
         "layout": "band-major; row-major within band",
-        "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)",
+        "payload": "frame header (112 B, MPLFRM04) + NES MapletCodec format-3 maplets (32-byte self-locating preamble, frame_id 0); see docs/maplet-format.md section 5",
     })
     format: str = STORE_FORMAT
     format_version: int = STORE_FORMAT_VERSION
@@ -78,7 +78,8 @@ class Manifest:
         if d.get("format") != STORE_FORMAT:
             raise ValueError(f"not a tile store manifest (format={d.get('format')!r})")
         if d.get("record_version") != fmt.RECORD_VERSION:
-            raise ValueError(f"record version {d.get('record_version')} != {fmt.RECORD_VERSION}")
+            raise ValueError(f"record version {d.get('record_version')} != {fmt.RECORD_VERSION}; "
+                             "prepare the store again with this mabench version")
         raster = dict(d["raster"])
         if raster.get("transform") is not None:
             raster["transform"] = tuple(raster["transform"])

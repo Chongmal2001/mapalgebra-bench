@@ -23,8 +23,8 @@ def _store_from_arrays(path, like: TileStore, frames, workload=None, skip_tiles=
         from mabench import format as fmt
         for info in out.frames:
             buf = bytes(TileStore.open(path).backend.read_buffer(info.key))
-            kept = [(h, c.copy()) for h, c in fmt.iter_records(buf) if (h.tile_x, h.tile_y) not in skip_tiles]
-            data = fmt.pack_frame_header(info.frame_id, len(kept)) + b"".join(h.pack() + fmt.encode_blob(c) for h, c in kept)
+            kept = [(h, c.copy()) for h, c in fmt.iter_maplets(buf) if (h.tile_x, h.tile_y) not in skip_tiles]
+            data = fmt.encode_frame(fmt.unpack_frame_header(buf), kept)
             (path / info.key).write_bytes(data)
     return TileStore.open(path)
 

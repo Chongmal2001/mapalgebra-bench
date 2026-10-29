@@ -26,8 +26,8 @@
       "event_time_ms": 0,
       "key": "frames/f000000.mpl",
       "n_records": 8,
-      "nbytes": 33232,
-      "sha256": "dc78573a44d6f4ca03c955799b0935602974f8745d655c2808218e8f0e9f5868",
+      "nbytes": 33136,
+      "sha256": "7308054d5a749c6b5cdbfe1e9e5af7c4d1592068d722406fac984c696c056096",
       "valid_cells": 2950,
       "source": {
         "frame": 0
@@ -71,16 +71,16 @@
       "--tile-size",
       "16"
     ],
-    "created_utc": "2026-10-15T17:42:26+00:00"
+    "created_utc": "2026-10-21T17:45:13+00:00"
   },
   "cells": {
     "dtype": "float64",
     "byte_order": "little",
     "nodata": "nan",
     "layout": "band-major; row-major within band",
-    "payload": "NES MapletCodec WireFormat::Binary blob (24-byte preamble, noData NaN)"
+    "payload": "frame header (112 B, MPLFRM04) + NES MapletCodec format-3 maplets (32-byte self-locating preamble, frame_id 0); see docs/maplet-format.md section 5"
   },
   "format": "mabench-tilestore",
   "format_version": 1,
-  "record_version": 3
+  "record_version": 4
 }

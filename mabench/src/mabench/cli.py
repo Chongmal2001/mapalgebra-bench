@@ -7,6 +7,9 @@
   mabench workload  write workload.json for NES / GeoTrellis
   mabench reference oracle result for a workload -> output store
   mabench compare   candidate output vs reference output (exit 1 on FAIL)
+  mabench nes-query  NES statements that run a workload on a store and write a Binary dump
+  mabench import-nes NES Binary dump -> candidate output store
+  mabench perf-table throughput runs (scripts/run-perf.sh) -> one CSV row per run
 """
 
 from __future__ import annotations
@@ -147,6 +150,36 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--json", help="write the full report (per frame and stratum) to this file")
     p.add_argument("--heatmap", help="write an error heatmap of the first frame (PNG; needs matplotlib)")
 
+    p = sub.add_parser("nes-query", help="print the NES statements that run a workload on a store into a Binary dump")
+    p.add_argument("store")
+    p.add_argument("--workload", required=True)
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--dump", help="path the NES File sink writes to (absolute, as NES sees it)")
+    g.add_argument("--void", action="store_true", help="Void sink instead of the dump (throughput runs; needs --yaml)")
+    p.add_argument("--source", default="tiles", help="logical source name")
+    p.add_argument("--src-id", type=int, default=1)
+    p.add_argument("--yaml", action="store_true", help="write a nes-cli topology file instead of SQL statements")
+    p.add_argument("--worker", default="localhost:8080", help="worker gRPC address (--yaml)")
+    p.add_argument("--data-address", default="localhost:9090", help="worker data address (--yaml)")
+    p.add_argument("--store-path", help="store directory as the NES worker sees it (default: absolute local path)")
+    p.add_argument("--passthrough", action="store_true", help="source -> sink without the focal window (baseline)")
+    p.add_argument("--frames-per-window", type=int, default=1,
+                   help="tumbling window size in event-time steps between frames (default 1: one frame per window)")
+
+    p = sub.add_parser("import-nes", help="turn a NES Binary dump into a candidate output store")
+    p.add_argument("dump", help="file written by the NES File sink with output format Binary, sink schema "
+                                "(srcId UINT32, srcFrameId UINT32, ts UINT64, raster VARSIZED), all NOT NULL")
+    p.add_argument("--input", required=True, help="input store the NES query read (RasterFile source)")
+    p.add_argument("--workload", required=True, help="workload.json or short spec of the query (focal:mean:square:3)")
+    p.add_argument("--out", required=True)
+    p.add_argument("--src-id", type=int, help="require every record to carry this srcId "
+                                              "(default: all records must share one srcId)")
+    p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("perf-table", help="collect throughput runs (scripts/run-perf.sh) into one CSV, one row per run")
+    p.add_argument("root", help="directory searched for meta.json files, e.g. data/perf")
+    p.add_argument("--out", required=True, help="CSV file")
+
     args = ap.parse_args(argv)
     say = lambda msg: print(msg, file=sys.stderr)
 
@@ -213,6 +246,30 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             save_report(report, args.json)
         return 0 if report.passed else 1
+    elif args.cmd == "nes-query":
+        from .nes_dump import nes_query
+        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        if args.void and not args.yaml:
+            raise SystemExit("nes-query: --void needs --yaml")
+        print(nes_query(TileStore.open(args.store), w, None if args.void else args.dump, args.source, args.src_id, yaml=args.yaml,
+                        worker=args.worker, data_address=args.data_address, store_path=args.store_path,
+                        passthrough=args.passthrough, frames_per_window=args.frames_per_window))
+    elif args.cmd == "import-nes":
+        from .nes_dump import import_nes
+        _refuse_existing(args.out, args.force)
+        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        try:
+            m, report = import_nes(args.dump, TileStore.open(args.input), w, args.out, src_id=args.src_id,
+                                   provenance=_provenance(argv), progress=say)
+        except ValueError as exc:
+            raise SystemExit(f"import-nes: {exc}")
+        for note in report.notes():
+            say(f"note: {note}")
+        say(f"wrote {len(m.frames)} frame(s) from {report.records} record(s) to {args.out}")
+    elif args.cmd == "perf-table":
+        from .perf import write_table
+        n = write_table(args.root, args.out)
+        say(f"wrote {n} run(s) to {args.out}")
     return 0
 
 

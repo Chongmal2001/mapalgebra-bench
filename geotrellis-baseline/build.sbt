@@ -25,5 +25,5 @@ lazy val root = (project in file("."))
       Seq(s"-Xms$heap", s"-Xmx$heap", "-XX:+AlwaysPreTouch")
     },
     Test / fork := true,
-    Compile / mainClass := Some("de.tuberlin.dima.geotrellisbaseline.runner.BatchRunner")
+    Compile / mainClass := Some("de.tuberlin.dima.geotrellisbaseline.runner.Main")
   )

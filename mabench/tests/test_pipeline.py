@@ -23,48 +23,68 @@ REPO = __import__("pathlib").Path(__file__).resolve().parents[2]   # repository 
 
 # ---------------------------------------------------------------- format
 
-def test_record_header_layout_is_fixed():
-    h = fmt.RecordHeader(123456789012, 7, 3, 0, -1, 2, 256, 128)
+def test_frame_header_layout_is_fixed():
+    h = fmt.FrameHeader(7, 6, 123456789012, 70, 45, 32, 16, 3, 32633, (10.0, 0.0, 3e5, 0.0, -10.0, 5.8e6))
     b = h.pack()
-    assert len(b) == 32
-    assert struct.unpack("<QIHHiiII", b) == (123456789012, 7, 3, 0, -1, 2, 256, 128)
-    assert fmt.RecordHeader.unpack_from(b) == h
-    assert h.payload_nbytes == 24 + 3 * 256 * 128 * 8
-
-
-def test_blob_matches_mapletcodec_binary_layout():
-    cells = np.arange(6, dtype=float).reshape(2, 3)          # height 2, width 3
-    blob = fmt.encode_blob(cells)
-    assert len(blob) == 24 + 6 * 8
-    assert blob[:4] == bytes([2, 1, 1, 0])                    # Binary, Float64, 1 band, reserved
-    assert struct.unpack_from("<II", blob, 4) == (2, 3)       # height before width
-    assert blob[12:16] == bytes(4)                            # reserved
-    assert np.isnan(struct.unpack_from("<d", blob, 16)[0])    # noData sentinel NaN
-    assert np.array_equal(np.frombuffer(blob, "<f8", offset=24), np.arange(6.0))
-    assert np.array_equal(fmt.decode_blob(blob, 0, 1, 2, 3)[0], cells)
-    bad = bytearray(blob); bad[16:24] = struct.pack("<d", 0.0)
+    assert len(b) == 112
+    v = struct.unpack("<8sIIQIIIIBBHIdII6d", b)
+    assert v[:11] == (b"MPLFRM04", 7, 6, 123456789012, 70, 45, 32, 16, 3, 1, 0)
+    assert v[11] == 0 and np.isnan(v[12]) and v[13:15] == (32633, 0) and v[15:] == (10.0, 0.0, 3e5, 0.0, -10.0, 5.8e6)
+    u = fmt.FrameHeader.unpack_from(b)
+    assert (u.tiles_x, u.tiles_y, u.maplet_nbytes) == (3, 3, 32 + 3 * 16 * 32 * 8)
+    assert u.maplet_offset(2) == 112 + 2 * u.maplet_nbytes
+    bad = bytearray(b); bad[48:56] = struct.pack("<d", 0.0)
     with pytest.raises(ValueError, match="noData"):
-        fmt.decode_blob(bytes(bad), 0, 1, 2, 3)
-    with pytest.raises(ValueError, match="record header"):
-        fmt.decode_blob(blob, 0, 1, 3, 2)
+        fmt.FrameHeader.unpack_from(bytes(bad))
+    with pytest.raises(ValueError, match="magic"):
+        fmt.FrameHeader.unpack_from(b"MPLFRM03" + b[8:])
 
 
-def test_multiband_blob_is_band_major():
-    cells = np.arange(3 * 2 * 4, dtype=float).reshape(3, 2, 4)   # 3 bands, height 2, width 4
-    blob = fmt.encode_blob(cells)
-    assert blob[2] == 3 and struct.unpack_from("<II", blob, 4) == (2, 4)
-    assert np.array_equal(np.frombuffer(blob, "<f8", offset=24), np.arange(24.0))   # band 0 first
-    assert np.array_equal(fmt.decode_blob(blob, 0, 3, 2, 4), cells)
-    with pytest.raises(ValueError, match="record header"):
-        fmt.decode_blob(blob, 0, 1, 2, 4)
+def test_maplet_layout_is_fixed():
+    h = fmt.MapletHeader(bands=3, tile_x=-1, tile_y=2, height=4, width=5, raster_width=70, raster_height=45,
+                         frame_id=9, flags=fmt.FLAG_FILLED)
+    cells = np.arange(60, dtype=float).reshape(3, 4, 5)
+    blob = fmt.encode_maplet(h, cells)
+    assert len(blob) == h.nbytes == 32 + 60 * 8
+    assert struct.unpack_from("<BBBBIiiIIII", blob) == (3, 1, 3, 1, 9, -1, 2, 4, 5, 70, 45)
+    assert np.array_equal(np.frombuffer(blob, "<f8", offset=32), np.arange(60.0))   # band-major, row-major
+    h2, c2 = fmt.decode_maplet(blob)
+    assert h2 == h and np.array_equal(c2, cells)
+    with pytest.raises(ValueError, match="do not match"):
+        fmt.encode_maplet(h, cells[:2])
     with pytest.raises(ValueError, match="band count"):
-        fmt.encode_blob(np.zeros((256, 1, 1)))
+        fmt.MapletHeader(256, 0, 0, 1, 1, 1, 1).pack()
+    with pytest.raises(ValueError, match="format"):
+        fmt.decode_maplet(bytes([2]) + blob[1:])
+    with pytest.raises(ValueError, match="needs"):
+        fmt.decode_maplet(blob[:-8])
 
 
-def test_trailing_bytes_are_rejected():
-    buf = fmt.pack_frame_header(0, 0) + b"x"
+def test_edge_tile_valid_extent():
+    h = fmt.MapletHeader(1, 2, 1, 8, 8, 20, 10)
+    assert (h.valid_rows, h.valid_cols) == (2, 4)
+
+
+def test_frame_file_framing_is_checked():
+    fh = fmt.FrameHeader(0, 1, 0, 2, 2, 2, 2, 1)
+    good = fmt.encode_frame(fh, [(fh.maplet_header(0, 0), np.ones((2, 2)))])
+    assert len(list(fmt.iter_maplets(good))) == 1
     with pytest.raises(ValueError, match="trailing"):
-        list(fmt.iter_records(buf))
+        list(fmt.iter_maplets(good + b"x"))
+    with pytest.raises(ValueError, match="truncated"):
+        list(fmt.iter_maplets(good[:-1]))
+    wrong = fmt.MapletHeader(1, 0, 0, 2, 2, 3, 2)          # raster width disagrees with the frame header
+    with pytest.raises(ValueError, match="disagrees"):
+        list(fmt.iter_maplets(fmt.encode_frame(fh, [(wrong, np.ones((2, 2)))])))
+    outside = fh.maplet_header(1, 0)
+    with pytest.raises(ValueError, match="outside grid"):
+        list(fmt.iter_maplets(fmt.encode_frame(fh, [(outside, np.ones((2, 2)))])))
+
+
+def test_crs_to_epsg():
+    assert fmt.crs_to_epsg("EPSG:32633") == 32633
+    assert fmt.crs_to_epsg(None) == 0
+    assert fmt.crs_to_epsg("not a crs") == 0
 
 
 # ---------------------------------------------------------------- synthetic + tiling
@@ -253,22 +273,6 @@ def test_cli_end_to_end(tmp_path, capsys):
         main(["synth", "--out", s, "--width", "8", "--height", "8", "--generator", "constant", "--tile-size", "8"])
     (tmp_path / "s" / "frames" / "f000001.mpl").write_bytes(b"garbage")
     assert main(["verify", s]) == 1
-
-
-# ---------------------------------------------------------------- NES golden blob stays in sync
-
-def test_cpp_golden_blobs_match_encoder():
-    import pathlib, re
-    src = (REPO / "nes" / "tests" / "MapletCodecGoldenTest.cpp").read_text()
-    def golden(name):
-        body = re.search(name + r" = \{(.*?)\};", src, re.S).group(1)
-        return bytes(int(h, 16) for h in re.findall(r"0x([0-9a-f]{2})", body))
-    single = np.array([[1.5, np.nan, 0.0], [-0.0, 5e-324, 1e308]])
-    assert fmt.encode_blob(single) == golden("GOLDEN_1BAND")
-    assert fmt.encode_blob(MULTI) == golden("GOLDEN_2BAND")
-
-
-MULTI = np.array([[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], [[-1.0, np.nan, 0.0], [10.0, 20.0, 30.0]]])
 
 
 def test_prepare_expands_and_sorts_glob_patterns(tmp_path):
