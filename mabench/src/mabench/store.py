@@ -31,14 +31,55 @@ class VerifyReport:
         return not self.problems
 
 
+class FrameRows:
+    """One frame, its maplets indexed by tile row once, so each strip touches only its own tiles.
+    Cells stay views into the frame buffer until ``close``."""
+
+    def __init__(self, store: "TileStore", frame_id: int):
+        m = store.manifest
+        self.bands, self.s, self.H, self.W = m.raster.bands, m.tiling.tile_size, m.raster.height, m.raster.width
+        self.tiles_x = m.tiling.tiles_x
+        self._buf = store.backend.read_buffer(m.frame(frame_id).key)
+        self.keys: list[tuple[int, int]] = []
+        self._rows: dict[int, list[tuple[int, np.ndarray]]] = {}
+        for h, cells in fmt.iter_maplets(self._buf):
+            self.keys.append((h.tile_x, h.tile_y))
+            self._rows.setdefault(h.tile_y, []).append((h.tile_x, cells))
+
+    def rows(self, row0: int, row1: int) -> np.ndarray:
+        s, H = self.s, self.H
+        if not 0 <= row0 < row1 <= H:
+            raise ValueError(f"rows [{row0}, {row1}) outside raster height {H}")
+        out = np.full((self.bands, row1 - row0, self.tiles_x * s), np.nan)
+        for ty in range(row0 // s, (row1 - 1) // s + 1):
+            t0 = ty * s
+            a, b = max(row0, t0), min(row1, t0 + s)
+            for tx, cells in self._rows.get(ty, ()):     # file order, so a later duplicate wins as before
+                out[:, a - row0:b - row0, tx * s:(tx + 1) * s] = cells[:, a - t0:b - t0, :]
+        return out[:, :, :self.W]
+
+    def close(self) -> None:
+        self._rows.clear()
+        _close(self._buf)
+
+    def __enter__(self) -> "FrameRows":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
 class TileStore:
-    def __init__(self, backend: StorageBackend, manifest: Manifest):
-        self.backend, self.manifest = backend, manifest
+    def __init__(self, backend: StorageBackend, manifest: Manifest, location=None):
+        self.backend, self.manifest, self.location = backend, manifest, location
 
     @classmethod
     def open(cls, location) -> "TileStore":
         backend = backend_for(location)
-        return cls(backend, Manifest.load(backend))
+        return cls(backend, Manifest.load(backend), str(location))
+
+    def frame_rows(self, frame_id: int) -> FrameRows:
+        return FrameRows(self, frame_id)
 
     def frame_header(self, frame_id: int) -> fmt.FrameHeader:
         buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
@@ -71,24 +112,10 @@ class TileStore:
 
     def assemble_rows(self, frame_id: int, row0: int, row1: int) -> np.ndarray:
         """Rows [row0, row1) of a frame as (bands, row1 - row0, width); only the tiles overlapping those rows
-        are decoded, so memory is proportional to the strip, not the frame. Missing tiles stay NaN."""
-        m = self.manifest
-        s, H, W = m.tiling.tile_size, m.raster.height, m.raster.width
-        if not 0 <= row0 < row1 <= H:
-            raise ValueError(f"rows [{row0}, {row1}) outside raster height {H}")
-        out = np.full((m.raster.bands, row1 - row0, m.tiling.tiles_x * s), np.nan)
-        ty0, ty1 = row0 // s, (row1 - 1) // s
-        buf = self.backend.read_buffer(m.frame(frame_id).key)
-        try:
-            for h, cells in fmt.iter_maplets(buf):          # cells are views; only overlapping rows are copied
-                if not ty0 <= h.tile_y <= ty1:
-                    continue
-                t0 = h.tile_y * s
-                a, b = max(row0, t0), min(row1, t0 + s)
-                out[:, a - row0:b - row0, h.tile_x * s:(h.tile_x + 1) * s] = cells[:, a - t0:b - t0, :]
-        finally:
-            _close(buf)
-        return out[:, :, :W]
+        are copied, so memory is proportional to the strip, not the frame. Missing tiles stay NaN.
+        For many strips of one frame use ``frame_rows`` (indexes the frame once)."""
+        with self.frame_rows(frame_id) as f:
+            return f.rows(row0, row1)
 
     def verify(self) -> VerifyReport:
         """Checksums, frame header vs manifest, maplet headers, tile grid completeness, valid cells, padding."""

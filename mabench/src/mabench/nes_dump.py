@@ -16,7 +16,10 @@ output store, so memory is proportional to the number of records, not to the dum
 
 Mapping back to the input: records are grouped by the maplet ``frame_id`` (one group = one focal output frame); a group
 maps through ``srcFrameId`` to the input frame of the same ``frame_id`` and is written under that id, so ``compare``
-matches frames. ``ts`` is a cross-check against the input frame's event time. Maplets are written with ``frame_id 0``
+matches frames. With sliding windows a frame is emitted once per window containing it, possibly under several output
+frame numbers; all copies of a tile must be identical, one is kept, and the number of copies per tile (emission
+multiplicity) is recorded; with ``windows_per_frame`` every tile must have exactly that many copies (else
+``multiplicity_problems``, which ``compare`` counts as coverage problems). ``ts`` is a cross-check against the input frame's event time. Maplets are written with ``frame_id 0``
 and ``flags 0`` as every store file requires; the FILLED flag is kept in the provenance instead.
 """
 
@@ -62,7 +65,10 @@ class DumpRecord:
 @dataclass
 class ImportReport:
     """What ``import_nes`` found besides hard errors; also recorded in the output provenance."""
-    out_frame_of: dict[int, int] = field(default_factory=dict)          # input frame id -> focal output frame no
+    out_frame_of: dict[int, int] = field(default_factory=dict)          # input frame id -> first focal output frame no
+    out_frames_of: dict[int, list[int]] = field(default_factory=dict)   # input frame id -> all its output frame nos
+    multiplicity: dict[int, dict[int, int]] = field(default_factory=dict)   # frame -> {copies: number of tiles}
+    multiplicity_problems: list[str] = field(default_factory=list)
     filled_tiles: dict[int, list[list[int]]] = field(default_factory=dict)
     missing_tiles: dict[int, list[list[int]]] = field(default_factory=dict)
     duplicates_dropped: int = 0
@@ -79,6 +85,7 @@ class ImportReport:
             out.append(f"frame {fid}: {len(tiles)} tile(s) flagged FILLED by NES, e.g. {tiles[:3]}")
         if self.duplicates_dropped:
             out.append(f"{self.duplicates_dropped} identical duplicate record(s) dropped")
+        out += self.multiplicity_problems
         for fid, tiles in self.padding_not_nodata.items():
             out.append(f"frame {fid}: padding of {len(tiles)} edge tile(s) is not NoData, e.g. {tiles[:3]} "
                        "(kept as written; compare ignores padding, verify reports it)")
@@ -138,8 +145,8 @@ def _maplet_bytes(fh: BinaryIO, rec: DumpRecord) -> bytes:
 
 
 def import_nes(dump_path: str, input_store: TileStore, workload, out_location: str, src_id: int | None = None,
-               provenance: dict[str, Any] | None = None,
-               progress: Callable[[str], None] | None = None) -> tuple[Manifest, ImportReport]:
+               provenance: dict[str, Any] | None = None, progress: Callable[[str], None] | None = None,
+               windows_per_frame: int | None = None) -> tuple[Manifest, ImportReport]:
     """Turn a NES dump into an output store on the input's raster and tiling (``bench-capabilities.md`` §9.1)."""
     if getattr(workload, "output_kind", None) is None or workload.output_kind.value != "raster":
         raise ValueError(f"import-nes needs a workload with raster output (focal), not {workload.name}")
@@ -180,7 +187,7 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
     groups: dict[int, list[DumpRecord]] = {}
     for r in records:
         groups.setdefault(r.maplet.frame_id, []).append(r)
-    in_of_out: dict[int, int] = {}
+    by_input: dict[int, list[DumpRecord]] = {}
     for out_no, recs in sorted(groups.items()):
         first = recs[0]
         for r in recs:
@@ -192,11 +199,9 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
         if first.ts != want_ts:
             raise ValueError(f"output frame {out_no}: ts {first.ts} != event time {want_ts} of input frame "
                              f"{first.src_frame_id}")
-        if first.src_frame_id in report.out_frame_of:
-            raise ValueError(f"output frames {report.out_frame_of[first.src_frame_id]} and {out_no} both map to input "
-                             f"frame {first.src_frame_id} (sliding windows? the dump schema has no window bounds)")
-        report.out_frame_of[first.src_frame_id] = out_no
-        in_of_out[out_no] = first.src_frame_id
+        report.out_frame_of.setdefault(first.src_frame_id, out_no)
+        report.out_frames_of.setdefault(first.src_frame_id, []).append(out_no)
+        by_input.setdefault(first.src_frame_id, []).extend(recs)
     report.frames_without_output = sorted(set(frames_by_id) - set(report.out_frame_of))
 
     # ---- placement and writing, one output frame at a time
@@ -206,17 +211,30 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
     s = mi.tiling.tile_size
     infos: list[FrameInfo] = []
     with open(dump_path, "rb") as dump:
-        for fid in sorted(in_of_out.values()):
-            recs = groups[report.out_frame_of[fid]]
+        for fid in sorted(by_input):
+            recs = by_input[fid]
             placed: dict[tuple[int, int], DumpRecord] = {}
+            copies: dict[tuple[int, int], int] = {}
             for r in recs:
+                copies[r.key] = copies.get(r.key, 0) + 1
                 if r.key in placed:
-                    if _maplet_bytes(dump, r) != _maplet_bytes(dump, placed[r.key]):
+                    a, b = _maplet_bytes(dump, r), _maplet_bytes(dump, placed[r.key])
+                    if a[fmt.MAPLET_PREAMBLE.size:] != b[fmt.MAPLET_PREAMBLE.size:] or \
+                            replace(r.maplet, frame_id=0) != replace(placed[r.key].maplet, frame_id=0):
                         raise ValueError(f"frame {fid}: tile {r.key} appears twice with different contents "
                                          f"(offsets {placed[r.key].offset} and {r.offset})")
                     report.duplicates_dropped += 1
                     continue
                 placed[r.key] = r
+            hist: dict[int, int] = {}
+            for n in copies.values():
+                hist[n] = hist.get(n, 0) + 1
+            report.multiplicity[fid] = dict(sorted(hist.items()))
+            if windows_per_frame is not None:
+                for n, count in sorted(hist.items()):
+                    if n != windows_per_frame:
+                        report.multiplicity_problems.append(
+                            f"frame {fid}: {count} tile(s) emitted {n}x, expected {windows_per_frame}x")
             present = [k for k in expected if k in placed]
             missing = [list(k) for k in expected if k not in placed]
             if missing:
@@ -257,7 +275,9 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
                          f"{len(expected)} tiles")
 
     nes = {"dump": str(dump_path), "src_id": next(iter(src_ids)), "records": report.records,
-           "out_frame_of": report.out_frame_of, "filled_tiles": report.filled_tiles,
+           "out_frame_of": report.out_frame_of, "out_frames_of": report.out_frames_of,
+           "windows_per_frame": windows_per_frame, "multiplicity": report.multiplicity,
+           "multiplicity_problems": report.multiplicity_problems, "filled_tiles": report.filled_tiles,
            "missing_tiles": report.missing_tiles, "duplicates_dropped": report.duplicates_dropped,
            "padding_not_nodata": report.padding_not_nodata, "frames_without_output": report.frames_without_output}
     manifest = Manifest(raster=mi.raster, tiling=mi.tiling, frames=infos,
@@ -280,13 +300,17 @@ SOURCE_SCHEMA = (("ts", "UINT64"), ("srcId", "UINT32"), ("srcFrameId", "UINT32")
 
 def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "tiles", src_id: int = 1,
               yaml: bool = False, worker: str = "localhost:8080", data_address: str = "localhost:9090",
-              store_path: str | None = None, passthrough: bool = False, frames_per_window: int = 1) -> str:
+              store_path: str | None = None, passthrough: bool = False, frames_per_window: int = 1,
+              slide_frames: int | None = None, bands: list[int] | None = None) -> str:
     """NES statements that run ``workload`` on ``store`` and write the dump ``import-nes`` reads: RasterFile source,
     one frame per tumbling window (window size = smallest event-time step between frames), the 9 positional
     ``FOCAL_*`` arguments from the manifest, File sink with output format Binary and the dump schema.
     ``dump_path=None``: Void sink instead (output discarded; throughput runs).
     ``passthrough=True``: the same source and sink without the focal window (baseline for source and sink cost).
     ``frames_per_window``: tumbling window of that many event-time steps (several frames per window).
+    ``slide_frames``: sliding window of ``frames_per_window`` steps advancing by ``slide_frames`` steps (each frame is in
+    frames_per_window / slide_frames windows); None or equal to ``frames_per_window`` = tumbling.
+    ``bands``: 1-based band indices; the focal input is ``BANDS(raster, i - 1, ...)`` (NES counts from 0) in a subquery.
 
     Default: SQL statements for ``nes-repl-embedded``. ``yaml=True``: a topology file for ``nes-cli`` (one worker).
     ``store_path`` overrides the store location as NES sees it (e.g. inside a container)."""
@@ -297,16 +321,28 @@ def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "
     steps = [b - a for a, b in zip(times, times[1:]) if b > a]
     if frames_per_window < 1:
         raise ValueError("frames_per_window must be >= 1")
-    window = (min(steps) if steps else 1000) * frames_per_window
+    step = min(steps) if steps else 1000
+    window = step * frames_per_window
+    clause = f"TUMBLING(ts, size {window} ms)"
+    if slide_frames is not None and slide_frames != frames_per_window:
+        if slide_frames < 1 or frames_per_window % slide_frames:
+            raise ValueError("slide_frames must be >= 1 and divide frames_per_window")
+        clause = f"SLIDING(ts, size {window} ms, advance by {step * slide_frames} ms)"
     r, t = m.raster, m.tiling
     location = store_path or store.backend.location
     location = location if "://" in location or store_path else os.path.abspath(location)
     call = (f"{NES_OPS[p['op']]}(raster, {NES_SHAPES[p['shape']]}, {p['radius']}, NODATA, nan, "
             f"{r.width}, {r.height}, {t.tile_size}, {t.tile_size})")
+    inner = source
+    if bands:
+        if any(b < 1 or b > r.bands for b in bands):
+            raise ValueError(f"bands {bands} outside 1..{r.bands}")
+        inner = (f"(SELECT ts, srcId, srcFrameId, BANDS(raster, {', '.join(str(b - 1) for b in bands)}) AS raster "
+                 f"FROM {source})")
     select = [
         "SELECT srcId, srcFrameId, ts, raster FROM (",
         f"    SELECT ts, srcId, srcFrameId, {call} AS raster",
-        f"    FROM {source} WINDOW TUMBLING(ts, size {window} ms)) INTO dump",
+        f"    FROM {inner} WINDOW {clause}) INTO dump",
     ]
     if passthrough:
         select = [f"SELECT srcId, srcFrameId, ts, raster FROM {source} INTO dump"]

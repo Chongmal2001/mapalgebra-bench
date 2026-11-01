@@ -4,9 +4,9 @@
 # VM, so perf cannot see the worker from the host. The image with perf is built once on top of DOCKER_IMAGE.
 #   scripts/nes/profile.sh TOPOLOGY.yaml OUT_DIR [SECONDS]
 # OUT_DIR gets the run-query.sh files plus perf.data, perf.log and perf-report.txt (own time per function).
-# Worker threads: PERF_THREADS (default 1, as in scripts/run-perf.sh).
+# Worker threads: PERF_THREADS (default 1, as in scripts/perf/run.sh).
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+source "$(dirname "$0")/../lib/common.sh"
 [[ "$NES_NATIVE" != 1 ]] || { echo "error: profile.sh needs Docker (NES_NATIVE=1)" >&2; exit 2; }
 [[ $# -ge 2 ]] || { sed -n '2,7p' "$0"; exit 2; }
 PROFILE_IMAGE="${PROFILE_IMAGE:-${DOCKER_IMAGE%:*}:perf}"

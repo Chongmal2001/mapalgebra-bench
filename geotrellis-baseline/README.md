@@ -7,7 +7,7 @@ tile stores as NES (written by mabench) and writes results as tile stores, so `m
 |---|---|---|
 | `fullgrid` | correctness reference | each frame and band as one untiled `DoubleArrayTile`, focal operation on the whole grid: no tiles, no halos |
 | `tiled` | compute core of the micro-batch baseline | each frame as a tiled layer, `CollectionFocalOperation` (halos from the 8 neighbouring tiles) |
-| `microbatch` | performance baseline | frames replayed at a rate into event-time tumbling windows, each frame a tiled layer as in `tiled`; latency, throughput, peak heap |
+| `microbatch` | performance baseline | frames replayed at a rate into event-time tumbling windows, each frame a tiled layer as in `tiled`; latency, throughput, CPU, memory |
 
 ## Build, test, run
 
@@ -36,14 +36,18 @@ Mirrors a NES query `WINDOW TUMBLING(ts, size <window-ms> ms)` on the same store
 | `--rate FPS` | frames arrive every 1/FPS s, complete; `0` = all available at once (maximum throughput) | `0` |
 | `--trigger frame` | compute each frame when it arrives (as NES emits a frame on completeness) | `frame` |
 | `--trigger window` | compute all frames of a window when it closes (a frame of a later window arrives, or the stream ends) | |
-| `--output checksum` / `store` | sum of output cells (timed runs, no output I/O) / tile store (to compare with the full-grid reference) | `checksum` |
+| `--output checksum` / `store` / `none` | sum of output cells (inside the timed span) / tile store (to compare with the full-grid reference) / results discarded, like a NES Void sink (timed runs) | `checksum` |
 | `--warmup N` | compute the first N frames once before timing | `0` |
+| `--threads N` | worker threads for the kernel calls, all modes: microbatch / tiled run one kernel call per output tile and band on the pool (bands buffered in parallel), fullgrid computes stripes in parallel; results identical to 1 thread (fullgrid: see `--stripe-rows`) | `1` |
+| `--stripe-rows N` | fullgrid with `--threads` > 1: stripe height; Min / Max bit-identical to the whole frame, Sum / Mean within rounding, independent of N threads; `0` = whole frame, parallel over bands only | `256` |
+| `--sample-ms N` | resource samples (RSS, process CPU, used heap) every N ms into `resources.csv`, plus one at the span boundaries and after each batch | `100` |
 
 Frames never arrive incomplete, so there is no partial-frame path. Latency of a batch = end of its computation minus the
 scheduled arrival of its last frame, so reading the frame from disk and waiting behind earlier batches count, as in NES
 where the source reads inside the query. Output: `batches.csv` (one row per batch: window, frames, tiles, arrival, start,
-done, latency, queueing, compute time) and `summary.json` (parameters, wall time, throughput in cells/s, latency
-p50/p95/p99/max, peak heap, checksum). Heap need: (frames held + 3) × the largest frame; with `--trigger window` all
+done, latency, queueing, compute time), `summary.json` (parameters, elapsed time, compute / buffering / GC / CPU time,
+throughput in cells/s, latency p50/p95/p99/max, peak RSS and used heap inside the span, VmHWM, checksum) and
+`resources.csv` (RSS, CPU, used heap over time). Heap need: (frames held + 3) × the largest frame; with `--trigger window` all
 frames of a window are held.
 
 ## Options

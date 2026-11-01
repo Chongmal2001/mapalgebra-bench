@@ -1,0 +1,28 @@
+# Correctness cases (benchmark-design.md §3), run by scripts/correctness/suite.sh: CASES="K1 K3" selects, the
+# lines of an ID together form the case. Syntax: scripts/lib/plan.py. Stores: scripts/data/stores.conf.
+# id  stores       ops:shapes:radii                            settings (environment of scripts/correctness/case.sh)
+
+# K1 main matrix: every op, both shapes, radii; all summation modes on square sum / mean; 4 frames per tumbling window
+K1    main         sum,mean,min,max:square,circle:1,2,4,8,16  SUMMATION=all
+K1    main         sum,mean,min,max:square,circle:4           SUMMATION=all WINDOW_FRAMES=4
+# K2 reach beyond the 8 neighbouring tiles: r = 20 > T = 16 (halo across 5 x 5 tiles)
+K2    halo         sum,mean,min,max:square,circle:20          SUMMATION=all
+# K3 sliding windows: 2 frames per window, advancing by 1 (each frame in 2 windows, every tile emitted twice)
+K3    sub4         sum,mean,min,max:square,circle:1,4         WINDOW_FRAMES=2 WINDOW_SLIDE=1
+# K4 band selection before focal: NES reads sub4 through BANDS(raster, ...), reference on the band-subset store
+K4    b2           mean,max:square,circle:1,4                 NES_INPUT=sub4 NES_BANDS=2
+K4    b31          mean,max:square,circle:1,4                 NES_INPUT=sub4 NES_BANDS=3,1
+# K5 fractional data: S2 reflectance (DN * 1e-4 - 0.1) and synthetic normal values, every summation mode
+K5    refl4,syn-normal  sum,mean:square:1,4,16                SUMMATION=all
+K5    refl4,syn-normal  sum,mean:circle:4                     SUMMATION=exact
+# K6 adversarial dynamic range: exact and Kahan within tolerance; plain running sums are expected to exceed it
+K6    syn-adv      sum,mean:square:2,8                        SUMMATION=exact,kahan
+K6    syn-adv      sum,mean:square:2,8                        SUMMATION=running EXPECT=fail
+# K7 NoData: sparse NoData, blocks larger than the window (all-NoData windows), blocks across seams, a NoData tile
+K7    nan4,syn-nodata  sum,mean,min,max:square,circle:1,4,16
+# K8 missing tiles (deadline path): single tile, seam pair, tile row, raster-edge column; 1 and 4 frames per window
+K8    gaps4        sum,mean,min,max:square,circle:1,4         WINDOW_FRAMES=1,4
+# K9 thread stress: many small tiles, 16 worker threads (same reference as with 4)
+K9    halo4        mean,max:square,circle:1,4,20              NES_THREADS=16 CASE_TAG=t16
+# K10 documented limit: reach > 3 tiles (r = 50 at T = 16) must be rejected with an error, not computed wrongly
+K10   halo4        max:square:50                              EXPECT=error

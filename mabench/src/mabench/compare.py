@@ -5,7 +5,15 @@ Implements the correctness metrics of evaluation-spec §3.2 for raster outputs (
 - coverage: every expected tile present exactly once;
 - NoData agreement: confusion matrix of NoData masks;
 - exact-match and tolerance-match rates; max absolute error; RMSE; max ULP distance;
-- all of it per stratum: interior, seam band, raster-edge band, near-NoData, near-missing-tile.
+- all of it per stratum: interior, seam band, raster-edge band, near-NoData, near-missing-tile;
+- tolerance utilisation (Sum / Mean): max over cells of |a - b| / bound, so a report shows how close a result gets to
+  the bound, not only PASS / FAIL (<= 1 everywhere = within tolerance).
+
+Tiles missing from the input frame: where the candidate has an output tile there anyway (NES completes such a frame at
+the window deadline and emits every output, the missing positions flagged FILLED, computed from the neighbours with the
+gap as NoData, like the reference), it is compared as usual; where it has none, the cells are left out of every
+stratum. The neighbours of a gap are the ``near_missing_tile`` stratum. A candidate that NES imported with an expected emission multiplicity (sliding windows,
+``import-nes --windows-per-frame``) carries its multiplicity problems in its provenance; they count as coverage problems.
 
 Tolerance (spec §3.2, decision D3): Min/Max must match bit for bit. Sum must satisfy
 |a - b| <= tau * sum_{V(c)} |v|, Mean the same bound divided by |V(c)|, i.e. tau * mean_{V(c)} |v|.
@@ -41,6 +49,34 @@ def ulp_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return d.astype(np.float64)
 
 
+def _near(mask: np.ndarray, fp: np.ndarray) -> np.ndarray:
+    """True where the footprint around a cell covers a True cell of ``mask`` (zero outside the array).
+
+    Equal to ``correlate(mask, fp) > 0.5``. Footprints whose rows are centred runs (square, circle) are applied
+    as one horizontal max filter per run width plus row shifts, O(r) per cell instead of O(r^2)."""
+    r = fp.shape[0] // 2
+    runs = []
+    for dy in range(-r, r + 1):
+        idx = np.flatnonzero(fp[dy + r])
+        if idx.size == 0:
+            continue
+        lo, hi = idx[0] - r, idx[-1] - r
+        if idx.size != hi - lo + 1 or lo != -hi:
+            return ndi.correlate(mask.astype(np.float64), fp.astype(np.float64), mode="constant", cval=0.0) > 0.5
+        runs.append((dy, int(hi)))
+    n = mask.shape[0]
+    m8 = mask.astype(np.uint8)
+    horiz = {w: ndi.maximum_filter1d(m8, 2 * w + 1, axis=1, mode="constant", cval=0) for w in {w for _, w in runs}}
+    out = np.zeros(mask.shape, bool)
+    for dy, w in runs:
+        h = horiz[w]
+        if dy >= 0:
+            out[:n - dy] |= h[dy:].astype(bool)
+        else:
+            out[-dy:] |= h[:n + dy].astype(bool)
+    return out
+
+
 def strata_masks(input_frame: np.ndarray, tile_size: int, radius: int, missing_tiles: set[tuple[int, int]],
                  fp: np.ndarray, row0: int = 0, height: int | None = None) -> dict[str, np.ndarray]:
     """Boolean (n, W) masks per stratum, from input rows [row0, row0 + n) of a raster of total ``height``.
@@ -65,16 +101,14 @@ def strata_masks(input_frame: np.ndarray, tile_size: int, radius: int, missing_t
     internal_y = ((yy % s < r) & (yy >= s)) | ((s - 1 - yy % s < r) & (yy // s < (H - 1) // s))
     seam = internal_x | internal_y
     raster_edge = (xx < r) | (yy < r) | (xx >= W - r) | (yy >= H - r)
-    fpf = fp.astype(np.float64)
-    nodata = np.isnan(input_frame).any(axis=0).astype(np.float64)
-    near_nodata = ndi.correlate(nodata, fpf, mode="constant", cval=0.0) > 0.5
+    near_nodata = _near(np.isnan(input_frame).any(axis=0), fp)
     near_missing = np.zeros((n, W), bool)
     rows_here = [(tx, ty) for tx, ty in missing_tiles if ty * s < row0 + n + r and (ty + 1) * s > row0 - r]
     if rows_here:
-        miss = np.zeros((n, W))
+        miss = np.zeros((n, W), bool)
         for tx, ty in rows_here:
-            miss[max(ty * s - row0, 0):max((ty + 1) * s - row0, 0), tx * s:(tx + 1) * s] = 1.0
-        near_missing = ndi.correlate(miss, fpf, mode="constant", cval=0.0) > 0.5
+            miss[max(ty * s - row0, 0):max((ty + 1) * s - row0, 0), tx * s:(tx + 1) * s] = True
+        near_missing = _near(miss, fp)
     seam, raster_edge = np.broadcast_to(seam, (n, W)), np.broadcast_to(raster_edge, (n, W))
     interior = ~(seam | raster_edge | near_nodata | near_missing)
     return {"all": np.ones((n, W), bool), "interior": interior, "seam": seam, "raster_edge": raster_edge,
@@ -95,6 +129,7 @@ class StratumMetrics:
     max_abs_error: float = 0.0
     sum_sq_error: float = 0.0
     max_ulp: float = 0.0
+    max_tol_util: float = 0.0          # max |a - b| / bound over data cells; inf where the bound is 0 but a != b
 
     def add(self, other: "StratumMetrics") -> None:
         for k in ("cells", "nodata_both", "nodata_only_candidate", "nodata_only_reference", "data_both",
@@ -102,6 +137,7 @@ class StratumMetrics:
             setattr(self, k, getattr(self, k) + getattr(other, k))
         self.max_abs_error = max(self.max_abs_error, other.max_abs_error)
         self.max_ulp = max(self.max_ulp, other.max_ulp)
+        self.max_tol_util = max(self.max_tol_util, other.max_tol_util)
 
     def summary(self) -> dict[str, Any]:
         d = asdict(self)
@@ -127,7 +163,14 @@ def _metrics(cand: np.ndarray, ref: np.ndarray, tol: np.ndarray | None, mask: np
         a, b = c[both], r[both]
         err = np.abs(a - b)
         out.exact = int((a == b).sum())
-        out.within_tolerance = int((err <= tol[m][both]).sum()) if tol is not None else out.exact
+        if tol is not None:
+            bound = tol[m][both]
+            out.within_tolerance = int((err <= bound).sum())
+            with np.errstate(divide="ignore", invalid="ignore"):
+                util = np.where(bound > 0, err / np.where(bound > 0, bound, 1.0), np.where(err > 0, np.inf, 0.0))
+            out.max_tol_util = float(util.max())
+        else:
+            out.within_tolerance = out.exact
         out.max_abs_error = float(err.max())
         out.sum_sq_error = float((err ** 2).sum())
         out.max_ulp = float(ulp_distance(a, b).max())
@@ -140,6 +183,7 @@ class CompareReport:
     tau: float
     frames: dict[int, dict[str, StratumMetrics]] = field(default_factory=dict)
     coverage_problems: list[str] = field(default_factory=list)
+    missing_input_tiles: dict[int, int] = field(default_factory=dict)
 
     def totals(self) -> dict[str, StratumMetrics]:
         tot = {s: StratumMetrics() for s in STRATA}
@@ -164,20 +208,26 @@ class CompareReport:
             "workload": self.workload, "tau": self.tau, "passed": self.passed,
             "criterion": "exact" if self.exact_op else "tolerance",
             "coverage_problems": self.coverage_problems,
+            "missing_input_tiles": {str(f): n for f, n in self.missing_input_tiles.items()},
             "totals": {s: m.summary() for s, m in self.totals().items()},
             "frames": {str(f): {s: m.summary() for s, m in per.items()} for f, per in self.frames.items()},
         }
 
     def table(self) -> str:
-        rows = [f"{'stratum':<18}{'cells':>10}{'NoData agree':>14}{'exact':>10}{'within tol':>12}{'max |err|':>12}{'max ULP':>10}"]
+        rows = [f"{'stratum':<18}{'cells':>10}{'NoData agree':>14}{'exact':>10}{'within tol':>12}{'max |err|':>12}"
+                f"{'max ULP':>10}{'tol util':>10}"]
         for s, m in self.totals().items():
             d = m.summary()
             rows.append(f"{s:<18}{d['cells']:>10}{d['nodata_agreement']:>14.4%}{d['exact_rate']:>10.4%}"
-                        f"{d['tolerance_rate']:>12.4%}{d['max_abs_error']:>12.3g}{d['max_ulp']:>10.3g}")
+                        f"{d['tolerance_rate']:>12.4%}{d['max_abs_error']:>12.3g}{d['max_ulp']:>10.3g}"
+                        f"{d['max_tol_util']:>10.3g}")
         verdict = "PASS" if self.passed else "FAIL"
         crit = "bitwise equality" if self.exact_op else f"|a-b| <= {self.tau:g} * sum|v| over V(c)"
         rows.append(f"{verdict} ({crit}; NoData masks must agree; all tiles present once)")
         rows += [f"coverage: {p}" for p in self.coverage_problems]
+        if self.missing_input_tiles:
+            rows.append(f"not compared: {sum(self.missing_input_tiles.values())} tile(s) missing from the input "
+                        "without a candidate output")
         return "\n".join(rows)
 
 
@@ -188,7 +238,9 @@ def _workload_of(store: TileStore) -> dict[str, Any] | None:
 
 
 def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileStore, op: str, shape: str,
-                  radius: int, tau: float = DEFAULT_TAU, heatmap: str | None = None) -> CompareReport:
+                  radius: int, tau: float = DEFAULT_TAU, heatmap: str | None = None,
+                  jobs: int | str | None = 1) -> CompareReport:
+    """``jobs``: worker processes over frames (int or "auto"); results are identical to the serial run."""
     mi, mr, mc = input_store.manifest, reference.manifest, candidate.manifest
     for name, m in (("reference", mr), ("candidate", mc)):
         if m.raster != mi.raster or m.tiling != mi.tiling:
@@ -200,9 +252,8 @@ def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileS
             raise ValueError(f"{name} was produced by workload {w.get('params')}, not {workload['params']}")
 
     report = CompareReport(workload=workload, tau=tau)
-    fp = oracle.footprint(shape, radius)
-    s, tx_n, ty_n = mi.tiling.tile_size, mi.tiling.tiles_x, mi.tiling.tiles_y
-    expected = {(x, y) for y in range(ty_n) for x in range(tx_n)}
+    nes = mc.provenance.get("nes") or {}
+    report.coverage_problems += [f"emission multiplicity: {p}" for p in nes.get("multiplicity_problems", [])]
     ref_ids = {f.frame_id for f in mr.frames}
     cand_ids = {f.frame_id for f in mc.frames}
     for fid in sorted(ref_ids - cand_ids):
@@ -210,43 +261,107 @@ def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileS
     for fid in sorted(cand_ids - ref_ids):
         report.coverage_problems.append(f"frame {fid} in candidate but not in reference")
 
-    H, W, r = mi.raster.height, mi.raster.width, radius
-    for info in mi.frames:
-        fid = info.frame_id
-        if fid not in ref_ids or fid not in cand_ids:
-            continue
-        in_keys, cand_keys = input_store.keys(fid), candidate.keys(fid)
+    frames = [f.frame_id for f in mi.frames if f.frame_id in ref_ids and f.frame_id in cand_ids]
+    first = mi.frames[0].frame_id
+    tasks = [(fid, op, shape, radius, tau, heatmap if fid == first else None) for fid in frames]
+    stores = (input_store, reference, candidate)
+    n = resolve_jobs(jobs, len(tasks), mi, radius)
+    if n > 1 and all(st.location for st in stores):
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(n, mp_context=mp.get_context("spawn"), initializer=_worker_init,
+                                 initargs=tuple(st.location for st in stores)) as pool:
+            results = list(pool.map(_worker_frame, tasks))
+    else:
+        results = [_compare_frame(stores, *t) for t in tasks]
+    for fid, per, problems, n_missing in results:    # frame order, as the serial loop
+        report.coverage_problems += problems
+        report.frames[fid] = per
+        if n_missing:
+            report.missing_input_tiles[fid] = n_missing
+    return report
+
+
+def resolve_jobs(jobs: int | str | None, n_frames: int, manifest, radius: int) -> int:
+    """Worker processes: an int, or "auto" = usable cores, capped by frames and by available memory
+    (one worker holds ~12 strip-sized arrays: bands x (tile_size + 2r) x width float64)."""
+    if jobs in (None, "auto"):
+        import os
+        cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+        per_worker = 12 * 8 * manifest.raster.bands * (manifest.tiling.tile_size + 2 * radius) * manifest.raster.width
+        per_worker += 300 * 2**20                    # interpreter, numpy, scipy
+        avail = _mem_available()
+        jobs = min(cores, avail // per_worker) if avail else cores
+    return max(1, min(int(jobs), n_frames))
+
+
+def _mem_available() -> int | None:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+_STORES: tuple[TileStore, TileStore, TileStore] | None = None
+
+
+def _worker_init(*locations) -> None:
+    global _STORES
+    _STORES = tuple(TileStore.open(loc) for loc in locations)
+
+
+def _worker_frame(task):
+    return _compare_frame(_STORES, *task)
+
+
+def _compare_frame(stores, fid: int, op: str, shape: str, radius: int, tau: float, heatmap: str | None):
+    """Metrics and coverage problems of one frame, strip by strip (one tile row each): memory ~ width x
+    (tile_size + 2r) cells per array, not the frame."""
+    input_store, reference, candidate = stores
+    mi = input_store.manifest
+    s, H, W, r = mi.tiling.tile_size, mi.raster.height, mi.raster.width, radius
+    expected = {(x, y) for y in range(mi.tiling.tiles_y) for x in range(mi.tiling.tiles_x)}
+    fp = oracle.footprint(shape, radius)
+    problems = []
+    with input_store.frame_rows(fid) as xin, reference.frame_rows(fid) as xref, candidate.frame_rows(fid) as xcand:
+        in_keys, cand_keys = xin.keys, xcand.keys
         missing_input = expected - set(in_keys)
         dup = len(cand_keys) - len(set(cand_keys))
         lost = (expected - missing_input) - set(cand_keys)
         if dup:
-            report.coverage_problems.append(f"frame {fid}: {dup} duplicate tile(s) in candidate")
+            problems.append(f"frame {fid}: {dup} duplicate tile(s) in candidate")
         if lost:
-            report.coverage_problems.append(f"frame {fid}: {len(lost)} tile(s) missing from candidate, e.g. {sorted(lost)[:3]}")
+            problems.append(f"frame {fid}: {len(lost)} tile(s) missing from candidate, e.g. {sorted(lost)[:3]}")
 
-        # strip by strip (one tile row each): memory ~ width x (tile_size + 2r) cells per array, not the frame
         per = {name: StratumMetrics() for name in STRATA}
-        hm = _Heatmap(H, W) if heatmap is not None and fid == mi.frames[0].frame_id else None
+        hm = _Heatmap(H, W) if heatmap is not None else None
         for y0 in range(0, H, s):
             y1 = min(H, y0 + s)
             a0, a1 = max(0, y0 - r), min(H, y1 + r)           # input rows incl. r-row halo
             inner = slice(y0 - a0, y0 - a0 + (y1 - y0))
-            x = input_store.assemble_rows(fid, a0, a1)
-            ref, cand = reference.assemble_rows(fid, y0, y1), candidate.assemble_rows(fid, y0, y1)
+            x = xin.rows(a0, a1)
+            ref, cand = xref.rows(y0, y1), xcand.rows(y0, y1)
             tol = None
             if op in ("sum", "mean"):
                 absx = np.where(np.isnan(x), np.nan, np.abs(x))
                 tol = tau * np.stack([oracle.focal(absx[b], op, fp)[inner] for b in range(x.shape[0])])
                 tol = np.where(np.isnan(tol), 0.0, tol)
             masks = strata_masks(x, s, radius, missing_input, fp, row0=a0, height=H)
+            present = np.ones((y1 - y0, W), bool)
+            for tx, ty in missing_input - set(cand_keys):
+                if ty * s < y1 and (ty + 1) * s > y0:
+                    present[max(ty * s, y0) - y0:min((ty + 1) * s, y1) - y0, tx * s:(tx + 1) * s] = False
             for name, mask in masks.items():
-                per[name].add(_metrics(cand, ref, tol, mask[inner]))
+                per[name].add(_metrics(cand, ref, tol, mask[inner] & present))
             if hm is not None:
                 hm.add(y0, cand, ref)
-        report.frames[fid] = per
-        if hm is not None:
-            hm.write(heatmap, s, f"{op}:{shape}:{radius}, frame {fid}")
-    return report
+    if hm is not None:
+        hm.write(heatmap, s, f"{op}:{shape}:{radius}, frame {fid}")
+    return fid, per, problems, len(missing_input - set(cand_keys))
 
 
 class _Heatmap:

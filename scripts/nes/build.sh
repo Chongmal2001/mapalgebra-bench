@@ -2,7 +2,7 @@
 # Configures and builds nes-single-node-worker and nes-cli in the NES development image.
 #   scripts/nes/build.sh [extra cmake --build args]
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+source "$(dirname "$0")/../lib/common.sh"
 [[ "$NES_NATIVE" != 1 ]] || { echo "error: NES_NATIVE=1; build on a Docker machine, then scripts/nes/bundle.sh" >&2; exit 2; }
 
 docker_run bash -c "

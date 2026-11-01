@@ -141,8 +141,6 @@ def test_framing_errors(env):
     (lambda recs: recs[0].__setitem__(3, _patch(recs[0][3], frame_id=0)), "frame_id 0"),
     (lambda recs: recs[0].__setitem__(3, _patch(recs[0][3], tile_x=7)), "outside grid"),
     (lambda recs: recs[0].__setitem__(0, 2), "several sources"),
-    (lambda recs: [r.__setitem__(3, _patch(r[3], frame_id=9)) for r in recs[:2] if r[1] == recs[0][1]],
-     "both map to input frame"),
 ])
 def test_consistency_errors(env, fault, message):
     tmp, inp, _, w, recs = env
@@ -250,3 +248,40 @@ def test_nes_query_frames_per_window(stores):
     from mabench.nes_dump import nes_query
     q = nes_query(TileStore.open(stores / "tiny-1b"), parse_workload("focal:sum:square:1"), "/x/d.bin", frames_per_window=3)
     assert "WINDOW TUMBLING(ts, size 300 ms)" in q
+
+
+def test_sliding_windows_multiplicity(env):
+    """Each frame emitted in 2 windows under different output frame numbers: one copy kept, multiplicity checked."""
+    tmp, inp, ref, w, recs = env
+    second = [[s, f, ts, _patch(m, frame_id=fmt.MapletHeader.unpack_from(m).frame_id + 10)] for s, f, ts, m in recs]
+    m, rep = import_nes(_write_dump(tmp / "d.bin", recs + second), inp, w, str(tmp / "out"), windows_per_frame=2)
+    assert rep.out_frames_of == {0: [1, 11], 1: [2, 12]} and not rep.multiplicity_problems
+    assert rep.multiplicity == {0: {2: 6}, 1: {2: 6}}
+    assert [f.sha256 for f in m.frames] == [f.sha256 for f in ref.manifest.frames]
+    assert w.compare(inp, ref, TileStore.open(tmp / "out")).passed
+    # one tile emitted only once: reported, and compare fails
+    short = second[1:]
+    _, rep = import_nes(_write_dump(tmp / "d2.bin", recs + short), inp, w, str(tmp / "out2"), windows_per_frame=2)
+    assert len(rep.multiplicity_problems) == 1 and "emitted 1x, expected 2x" in rep.multiplicity_problems[0]
+    cr = w.compare(inp, ref, TileStore.open(tmp / "out2"))
+    assert not cr.passed and any("multiplicity" in p for p in cr.coverage_problems)
+
+
+def test_nes_query_sliding_clause(stores):
+    from mabench.nes_dump import nes_query
+    q = nes_query(TileStore.open(stores / "tiny-1b"), parse_workload(WORKLOAD), "/d.bin", frames_per_window=2,
+                  slide_frames=1)
+    assert "WINDOW SLIDING(ts, size 200 ms, advance by 100 ms)" in q
+    assert "TUMBLING(ts, size 200 ms)" in nes_query(TileStore.open(stores / "tiny-1b"), parse_workload(WORKLOAD),
+                                                   "/d.bin", frames_per_window=2, slide_frames=2)
+    with pytest.raises(ValueError):
+        nes_query(TileStore.open(stores / "tiny-1b"), parse_workload(WORKLOAD), "/d.bin", frames_per_window=3,
+                  slide_frames=2)
+
+
+def test_nes_query_bands_subquery(stores):
+    from mabench.nes_dump import nes_query
+    q = nes_query(TileStore.open(stores / "tiny-2b"), parse_workload(WORKLOAD), "/d.bin", bands=[2, 1])
+    assert "FROM (SELECT ts, srcId, srcFrameId, BANDS(raster, 1, 0) AS raster FROM tiles) WINDOW TUMBLING" in q
+    with pytest.raises(ValueError):
+        nes_query(TileStore.open(stores / "tiny-2b"), parse_workload(WORKLOAD), "/d.bin", bands=[3])

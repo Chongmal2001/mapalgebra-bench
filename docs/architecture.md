@@ -89,7 +89,9 @@ Each output cell is computed from the same inputs in the same order as on the wh
 
 ### 3.4 `compare`
 
-Per frame, then per tile row with an r-row input halo:
+Per frame, then per tile row with an r-row input halo. Frames run in parallel worker processes (`--jobs`, default
+`auto`: usable cores, capped by the number of frames and by available memory; env `MABENCH_JOBS`); each frame file is
+indexed by tile row once, so a strip decodes only its own tiles. The report is identical for any `--jobs`.
 
 1. **Coverage.** Frames missing on either side, tiles missing from the candidate, duplicate tiles.
 2. **Read three strips.** Input rows with halo, reference rows, candidate rows (`assemble_rows`).

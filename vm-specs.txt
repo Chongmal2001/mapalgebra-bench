@@ -1,0 +1,11 @@
+CPU(s):                                  16
+Model name:                              QEMU Virtual CPU version 2.5+
+Thread(s) per core:                      1
+Core(s) per socket:                      1
+Socket(s):                               16
+L3 cache:                                256 MiB (16 instances)
+NUMA node(s):                            1
+
+               total        used        free      shared  buff/cache   available
+Mem:            60Gi       1,4Gi        31Gi        11Mi        29Gi        59Gi
+Swap:          8,0Gi          0B       8,0Gi

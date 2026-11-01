@@ -6,10 +6,10 @@
 #   smoke-2b    10x6,  2 bands, 4x4 tiles (3x2 grid, padded edge tiles), 2 frames, normal + NoData
 #   smoke-rgtt  12x12, 1 band,  4x4 tiles (3x3 grid), radius 5 > tile size,  2 frames, waves
 #
-# Writes $DATA/stores/smoke-*/ and oracle references $DATA/refs/oracle/smoke-*/<workload>/ (run-focal.sh with REF_SYSTEM=oracle).
-# Frames are 100 ms apart. Usage: scripts/gen-smoke-stores.sh
+# Writes $DATA/stores/smoke-*/ and oracle references $DATA/refs/oracle/smoke-*/<workload>/ (correctness/case.sh with REF_SYSTEM=oracle).
+# Frames are 100 ms apart. Usage: scripts/data/smoke-stores.sh
 set -euo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 DATA="$(realpath -m "${DATA:-$REPO/data}")"
 S="$DATA/stores"; R="$DATA/refs/oracle"
 mkdir -p "$S" "$R"

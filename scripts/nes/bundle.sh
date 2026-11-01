@@ -5,7 +5,7 @@
 # Takes the binaries of NES_BUILD (scripts/nes/build.sh) from the image DOCKER_IMAGE they were built in, then checks
 # that the bundle starts a worker in a plain ubuntu container (nothing from the build visible).
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+source "$(dirname "$0")/../lib/common.sh"
 [[ $# -eq 1 ]] || { sed -n '2,6p' "$0"; exit 2; }
 [[ "$NES_NATIVE" != 1 ]] || { echo "error: run on the build machine without NES_NATIVE=1" >&2; exit 2; }
 OUT="$(realpath -m "$1")"

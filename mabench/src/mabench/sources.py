@@ -209,6 +209,9 @@ class SyntheticSource(RasterSource):
     NoData overlays, applied after the generator:
       nodata_fraction p [0.0]          each cell independently NoData with probability p
       nodata_block y0,x0,y1,x1 [none]  half-open rectangle of NoData in global cell coordinates
+    Outlier overlay (high dynamic range, e.g. to break plain running sums), applied before NoData:
+      outlier_fraction p [0.0]         each cell independently replaced by +-outlier_scale with probability p
+      outlier_scale s [1e12]
     """
 
     def __init__(self, width: int, height: int, generator: str, params: dict[str, Any] | None = None,
@@ -260,6 +263,11 @@ class SyntheticSource(RasterSource):
                 v += np.sin(2 * np.pi * s * (np.cos(a) * xx + np.sin(a) * yy) / wl + ph + 0.1 * frame)
             v *= amp / len(ang)
         v = v.astype(np.float64)
+        of = float(p.get("outlier_fraction", 0.0))
+        if of > 0:
+            hit = _unit(self.seed, 5, index) < of
+            sign = np.where(_unit(self.seed, 6, index) < 0.5, -1.0, 1.0)
+            v[hit] = (float(p.get("outlier_scale", 1e12)) * sign)[hit]
         frac = float(p.get("nodata_fraction", 0.0))
         if frac > 0:
             v[_unit(self.seed, 4, index) < frac] = np.nan

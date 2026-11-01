@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Runs one nes-cli topology in a fresh container (worker + query, then exit) and waits for the query to end.
-# NES_NATIVE=1: same on the host, binaries from NES_BUNDLE.
+# Runs one nes-cli topology and waits for the query to end. With NES_WORKER_DIR the query goes to that running worker
+# (scripts/nes/worker.sh start); otherwise a worker is started in OUT_DIR for this query and stopped after it.
 #   scripts/nes/run-query.sh TOPOLOGY.yaml OUT_DIR
-# OUT_DIR gets status.json (final query status incl. started/stopped in µs), worker.log, cli.log, run.json,
-# worker_vmhwm (peak RSS of the worker). NES_PROFILE_SECS > 0 also samples the worker with perf (scripts/nes/profile.sh).
-# Exit code: 0 query Stopped, 1 Failed or worker died, 3 timeout.
+# OUT_DIR gets status.json (final query status incl. running/stopped in µs), cli.log, run.json; with its own worker also
+# worker.log, resources.csv, worker_vmhwm, worker_stat. NES_PROFILE_SECS > 0 also samples the worker with perf
+# (scripts/nes/profile.sh). Exit code: 0 query Stopped, 1 Failed or worker died, 3 timeout.
 set -euo pipefail
-source "$(dirname "$0")/common.sh"
+source "$(dirname "$0")/../lib/common.sh"
 
-[[ $# -eq 2 ]] || { sed -n '2,5p' "$0"; exit 2; }
+[[ $# -eq 2 ]] || { sed -n '2,7p' "$0"; exit 2; }
 TOPO="$(realpath "$1")"
 OUT="$(realpath -m "$2")"
+WORKER="$BENCH_REPO/scripts/nes/worker.sh"
 mkdir -p "$OUT"
-[[ -x "$NES_WORKER_BIN" && -x "$NES_CLI_BIN" ]] || { echo "error: NES binaries missing, run scripts/nes/build.sh (native: scripts/nes/bundle.sh)" >&2; exit 2; }
 grep -q 'localhost:8080' "$TOPO" || { echo "error: $TOPO must use worker localhost:8080" >&2; exit 2; }
 
 if [[ "$NES_NATIVE" == 1 ]]; then
@@ -21,11 +21,20 @@ if [[ "$NES_NATIVE" == 1 ]]; then
   RUNTIME=native NES_COMMIT="$BUNDLE_NES_COMMIT" NES_DIRTY="$BUNDLE_NES_DIRTY" IMAGE="$BUNDLE_IMAGE" CTX=none
   HOST_OS="$(. /etc/os-release && echo "$PRETTY_NAME")"
 else
-  RUNTIME=docker NES_COMMIT="$(git -C "$NES_REPO" rev-parse HEAD 2>/dev/null)"
+  RUNTIME=docker NES_COMMIT="$(git -C "$NES_REPO" rev-parse HEAD 2>/dev/null || true)"
   NES_DIRTY=$( [[ -n "$(git -C "$NES_REPO" status --porcelain --untracked-files=no 2>/dev/null)" ]] && echo true || echo false)
   IMAGE="$(docker image inspect --format '{{.Id}}' "$DOCKER_IMAGE")"
   CTX="$(docker context show 2>/dev/null)" HOST_OS="$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"
 fi
+
+WD="${NES_WORKER_DIR:-}"
+if [[ -z "$WD" ]]; then
+  WD="$OUT"
+  "$WORKER" start "$WD"
+  trap '"$WORKER" stop "$WD"' EXIT
+fi
+WD="$(realpath "$WD")"
+
 cat > "$OUT/run.json" <<EOF
 {
   "topology": "$TOPO",
@@ -37,6 +46,7 @@ cat > "$OUT/run.json" <<EOF
   "docker_context": "$CTX",
   "docker_host_os": "$HOST_OS",
   "worker_bin": "$NES_WORKER_BIN",
+  "worker_dir": "$WD",
   "pool_buffers": $NES_POOL_BUFFERS,
   "threads": $NES_THREADS,
   "max_inflight_buffers": $NES_MAX_INFLIGHT,
@@ -49,59 +59,41 @@ cat > "$OUT/run.json" <<EOF
 }
 EOF
 
-set +e
-docker_run bash -s <<EOF
-W='$NES_WORKER_BIN'; CLI='$NES_CLI_BIN'; OUT='$OUT'; TOPO='$TOPO'
-cd "\$OUT"
-"\$W" --grpc=localhost:8080 --data_address=localhost:9090 \
-  --worker.number_of_buffers_in_global_buffer_manager=$NES_POOL_BUFFERS \
-  --worker.query_engine.number_of_worker_threads=$NES_THREADS \
-  --worker.default_max_inflight_buffers=$NES_MAX_INFLIGHT $NES_WORKER_ARGS > "\$OUT/worker.log" 2>&1 &
-WPID=\$!
-for i in \$(seq 600); do
-  (: < /dev/tcp/localhost/8080) 2>/dev/null && break
-  kill -0 \$WPID 2>/dev/null || { echo "worker exited during startup, see \$OUT/worker.log" >&2; exit 1; }
-  sleep 0.1
-done
-(: < /dev/tcp/localhost/8080) 2>/dev/null || { echo "worker not listening on 8080 after 60 s" >&2; kill \$WPID; exit 1; }
-ID=\$("\$CLI" -t "\$TOPO" start 2>>"\$OUT/cli.log" | tail -n 1)
-[[ -n "\$ID" ]] || { echo "nes-cli start failed, see \$OUT/cli.log" >&2; kill \$WPID; exit 1; }
-echo "query \$ID" >&2
+cli() { "$WORKER" exec "$WD" "$NES_CLI_BIN" -t "$TOPO" "$@"; }
+ID="$(cli start 2>>"$OUT/cli.log" | tail -n 1)" || true
+[[ -n "$ID" ]] || { echo "nes-cli start failed, see $OUT/cli.log" >&2; exit 1; }
+echo "query $ID" >&2
+
 PERFPID=
 if (( ${NES_PROFILE_SECS:-0} > 0 )); then
-  PERF=\$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1)
-  (sleep 3; "\$PERF" record -F 999 -g -p \$WPID -o "\$OUT/perf.data" -- sleep ${NES_PROFILE_SECS:-0}) > "\$OUT/perf.log" 2>&1 &
-  PERFPID=\$!
+  WPID="$("$WORKER" pid "$WD")"
+  (sleep 3; "$WORKER" exec "$WD" bash -c "P=\$(ls /usr/lib/linux-tools/*/perf | head -n 1); \"\$P\" record -F 999 -g \
+    -p $WPID -o '$OUT/perf.data' -- sleep $NES_PROFILE_SECS") > "$OUT/perf.log" 2>&1 &
+  PERFPID=$!
 fi
-END=\$(( \$(date +%s) + $NES_TIMEOUT_S ))
+
+END=$(( $(date +%s) + NES_TIMEOUT_S ))
 RC=
-while [[ -z "\$RC" ]]; do
-  "\$CLI" -t "\$TOPO" status "\$ID" > "\$OUT/status.json" 2>>"\$OUT/cli.log"
-  if ! grep -qE '"query_status": *"(Registered|Started|Running)"' "\$OUT/status.json"; then
-    grep VmHWM /proc/\$WPID/status > "\$OUT/worker_vmhwm" 2>/dev/null
-    kill \$WPID; wait \$WPID 2>/dev/null
-    if grep -qE '"query_status": *"Stopped"' "\$OUT/status.json"; then RC=0; else RC=1; fi
-  elif ! kill -0 \$WPID 2>/dev/null; then
-    echo "worker died, see \$OUT/worker.log" >&2; RC=1
-  elif (( \$(date +%s) >= END )); then
-    "\$CLI" -t "\$TOPO" stop "\$ID" >>"\$OUT/cli.log" 2>&1; kill \$WPID; RC=3
+while [[ -z "$RC" ]]; do
+  cli status "$ID" > "$OUT/status.json" 2>>"$OUT/cli.log" || true
+  if ! grep -qE '"query_status": *"(Registered|Started|Running)"' "$OUT/status.json"; then
+    if grep -qE '"query_status": *"Stopped"' "$OUT/status.json"; then RC=0; else RC=1; fi
+  elif ! "$WORKER" alive "$WD"; then
+    echo "worker died, see $WD/worker.log" >&2; RC=1
+  elif (( $(date +%s) >= END )); then
+    cli stop "$ID" >>"$OUT/cli.log" 2>&1 || true; RC=3
   else
-    sleep $NES_POLL_S
+    sleep "$NES_POLL_S"
   fi
 done
-if [[ -n "\$PERFPID" ]]; then
-  wait \$PERFPID
-  "\$PERF" report -i "\$OUT/perf.data" --stdio --no-children -g none --sort dso,sym --percent-limit 0.5 \
-    > "\$OUT/perf-report.txt" 2>>"\$OUT/perf.log"
+if [[ -n "$PERFPID" ]]; then
+  wait "$PERFPID" || true
+  "$WORKER" exec "$WD" bash -c "P=\$(ls /usr/lib/linux-tools/*/perf | head -n 1); \"\$P\" report -i '$OUT/perf.data' \
+    --stdio --no-children -g none --sort dso,sym --percent-limit 0.5" > "$OUT/perf-report.txt" 2>>"$OUT/perf.log" || true
 fi
-if [[ -n "${HOST_IDS:-}" ]]; then chown -R ${HOST_IDS:-} "\$OUT"; fi
-exit \$RC
-EOF
-rc=$?
-set -e
-case $rc in
+case $RC in
   0) echo "stopped: $OUT/status.json" ;;
   3) echo "timeout after ${NES_TIMEOUT_S}s: $OUT" >&2 ;;
-  *) echo "failed (exit $rc): $OUT/status.json, $OUT/worker.log" >&2 ;;
+  *) echo "failed (exit $RC): $OUT/status.json, $WD/worker.log" >&2 ;;
 esac
-exit $rc
+exit $RC

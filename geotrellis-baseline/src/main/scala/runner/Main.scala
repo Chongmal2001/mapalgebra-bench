@@ -11,15 +11,19 @@ import de.tuberlin.dima.geotrellisbaseline.tilestore.TileStoreWriter
 
 /** {{{
   * sbt "run --mode fullgrid|tiled|microbatch --store DIR --workload (FILE.json | focal:<op>:<shape>:<r>) --out DIR [--no-verify]
-  *          [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store] [--warmup N]"
+  *          [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N]
+  *          [--sample-ms N]"
   * }}}
   * fullgrid: correctness reference (FullGridRunner). tiled: GeoTrellis layer focal per frame (BatchRunner).
-  * microbatch: performance baseline (MicroBatchRunner); the bracketed options apply to it only.
+  * microbatch: performance baseline (MicroBatchRunner); the options from --window-ms on apply to it only.
+  * --threads: worker threads for the kernel calls (default 1). --stripe-rows: fullgrid stripe height when threads > 1
+  * (default 256; 0 = whole frame, parallel over bands only).
   */
 object Main {
 
   final case class Args(mode: String, store: Path, workload: FocalWorkload, out: Path, verifyInput: Boolean,
-                        microbatch: MicroBatchRunner.Options = MicroBatchRunner.Options())
+                        microbatch: MicroBatchRunner.Options = MicroBatchRunner.Options(), threads: Int = 1,
+                        stripeRows: Int = 256)
 
   final case class FrameTiming(frameId: Int, tiles: Int, bands: Int, cells: Long, computeNanos: Long)
 
@@ -28,11 +32,13 @@ object Main {
   def parseArgs(argv: Array[String]): Args = {
     def usage(msg: String): Nothing = {
       System.err.println(s"$msg\nusage: run --mode ${Modes.mkString("|")} --store DIR --workload (FILE.json | focal:<op>:<shape>:<r>) --out DIR " +
-        "[--no-verify] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store] [--warmup N]")
+        "[--no-verify] [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N] [--sample-ms N]")
       sys.exit(2)
     }
     var mode, store, workload, out: Option[String] = None
     var verify = true
+    var threads = 1
+    var stripeRows = 256
     var mb = MicroBatchRunner.Options()
     def num[T](s: String, f: String => T, name: String): T = try f(s) catch { case _: NumberFormatException => usage(s"$name: not a number: $s") }
     val it = argv.iterator
@@ -42,23 +48,27 @@ object Main {
       case "--workload" if it.hasNext => workload = Some(it.next())
       case "--out" if it.hasNext => out = Some(it.next())
       case "--no-verify" => verify = false
+      case "--threads" if it.hasNext => threads = num(it.next(), _.toInt, "--threads")
+      case "--stripe-rows" if it.hasNext => stripeRows = num(it.next(), _.toInt, "--stripe-rows")
       case "--window-ms" if it.hasNext => mb = mb.copy(windowMs = num(it.next(), _.toLong, "--window-ms"))
       case "--rate" if it.hasNext => mb = mb.copy(rate = num(it.next(), _.toDouble, "--rate"))
       case "--trigger" if it.hasNext => mb = mb.copy(trigger = it.next())
       case "--output" if it.hasNext => mb = mb.copy(output = it.next())
       case "--warmup" if it.hasNext => mb = mb.copy(warmup = num(it.next(), _.toInt, "--warmup"))
+      case "--sample-ms" if it.hasNext => mb = mb.copy(sampleMs = num(it.next(), _.toLong, "--sample-ms"))
       case other => usage(s"unknown argument '$other'")
     }
     val md = mode.getOrElse(usage("--mode is required"))
     if (!Modes.contains(md)) usage(s"unknown mode '$md'")
     if (!Set("frame", "window").contains(mb.trigger)) usage(s"--trigger must be frame or window")
-    if (!Set("checksum", "store").contains(mb.output)) usage(s"--output must be checksum or store")
+    if (!Set("checksum", "store", "none").contains(mb.output)) usage(s"--output must be checksum, store or none")
+    if (threads < 1) usage("--threads must be >= 1")
     val w = workload.getOrElse(usage("--workload is required"))
     Args(md,
       Paths.get(store.getOrElse(usage("--store is required"))),
       if (w.endsWith(".json")) FocalWorkload.load(Paths.get(w)) else FocalWorkload.parse(w),
       Paths.get(out.getOrElse(usage("--out is required"))),
-      verify, mb)
+      verify, mb, threads, stripeRows)
   }
 
   /** Stops before reading anything if `factor` x the largest frame does not fit the heap. */
@@ -77,6 +87,7 @@ object Main {
     "mode" -> Json.fromString(args.mode),
     "geotrellis_version" -> Json.fromString(Option(classOf[geotrellis.raster.Tile].getPackage.getImplementationVersion).getOrElse("unknown")),
     "workload" -> args.workload.toJson,
+    "threads" -> Json.fromInt(args.threads),
     "input" -> Json.fromString(args.store.toString),
     "created_utc" -> Json.fromString(Instant.now().toString))
 

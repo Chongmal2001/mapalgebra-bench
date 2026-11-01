@@ -22,7 +22,8 @@ lazy val root = (project in file("."))
     // heap: 4g by default, GT_HEAP=24g sbt "run ..." for large frames (GeoTrellis needs ~4x the frame size)
     run / javaOptions ++= {
       val heap = sys.env.getOrElse("GT_HEAP", "4g")
-      Seq(s"-Xms$heap", s"-Xmx$heap", "-XX:+AlwaysPreTouch")
+      Seq(s"-Xms$heap", s"-Xmx$heap", "-XX:+AlwaysPreTouch") ++
+        sys.env.get("GT_JAVA_OPTS").toSeq.flatMap(_.split("\\s+")).filter(_.nonEmpty)   // e.g. -XX:UseAVX=0 (grid G5)
     },
     Test / fork := true,
     Compile / mainClass := Some("de.tuberlin.dima.geotrellisbaseline.runner.Main")

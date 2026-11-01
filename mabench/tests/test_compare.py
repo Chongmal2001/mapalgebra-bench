@@ -5,7 +5,7 @@ import pytest
 
 from mabench import oracle
 from mabench.cli import main
-from mabench.compare import strata_masks, ulp_distance
+from mabench.compare import _near, compare_focal, strata_masks, ulp_distance
 from mabench.sources import ArraySource, SyntheticSource
 from mabench.storage import backend_for
 from mabench.store import TileStore
@@ -220,3 +220,72 @@ def test_heatmap_blocks_keep_the_maximum(tmp_path):
     assert hm.mismatch[0, 0] and hm.mismatch.sum() == 1
     hm.write(str(tmp_path / "h.png"), 4, "test")
     assert (tmp_path / "h.png").stat().st_size > 0
+
+
+@pytest.mark.parametrize("shape", ["square", "circle"])
+def test_near_equals_correlation(shape):
+    from scipy import ndimage as ndi
+    rng = np.random.default_rng(5)
+    for r in (0, 1, 2, 5, 9):
+        fp = oracle.footprint(shape, r)
+        for density in (0.0, 0.002, 0.05):
+            m = rng.random((37, 29)) < density
+            want = ndi.correlate(m.astype(float), fp.astype(float), mode="constant", cval=0.0) > 0.5
+            assert np.array_equal(_near(m, fp), want), (r, density)
+
+
+def test_parallel_compare_equals_serial(setup):
+    tmp, inp, ref, w = setup
+    frames = [ref.assemble(f.frame_id) for f in ref.manifest.frames]
+    frames[1][0, 30, 40] += 1.0
+    cand = _store_from_arrays(tmp / "cand", inp, frames, w, skip_tiles={(2, 1)})
+    serial = compare_focal(inp, ref, cand, "mean", "square", 2, jobs=1, heatmap=str(tmp / "s.png"))
+    par = compare_focal(inp, ref, cand, "mean", "square", 2, jobs=2, heatmap=str(tmp / "p.png"))
+    assert json.dumps(serial.to_dict()) == json.dumps(par.to_dict())
+    assert not par.passed and (tmp / "p.png").stat().st_size > 1000
+
+
+def test_tolerance_utilisation(setup):
+    tmp, inp, ref, w = setup
+    frames = [ref.assemble(f.frame_id) for f in ref.manifest.frames]
+    same = w.compare(inp, ref, _store_from_arrays(tmp / "same", inp, frames, w)).totals()["all"]
+    assert same.max_tol_util == 0.0
+    tiny = w.compare(inp, ref, _store_from_arrays(tmp / "tiny", inp, [a * (1 + 1e-15) for a in frames], w))
+    assert 0.0 < tiny.totals()["all"].max_tol_util <= 1.0
+    big = w.compare(inp, ref, _store_from_arrays(tmp / "big", inp, [a + 1e-6 for a in frames], w))
+    assert big.totals()["all"].max_tol_util > 1.0
+    assert "max_tol_util" in big.to_dict()["totals"]["all"]
+
+
+def test_tiles_missing_from_the_input_are_not_compared(tmp_path):
+    src = tmp_path / "src"
+    assert main(["synth", "--out", str(src), "--width", "40", "--height", "30", "--generator", "normal",
+                 "--frames", "2", "--tile-size", "10", "--seed", "3"]) == 0
+    assert main(["derive", str(src), "--out", str(tmp_path / "gap"), "--drop-tiles", "*:1,1"]) == 0
+    inp = TileStore.open(tmp_path / "gap")
+    w = FocalWorkload("sum", "square", 2)
+    w.reference(inp, str(tmp_path / "ref"))
+    ref = TileStore.open(tmp_path / "ref")
+    # a streaming candidate: everything but the tile that never arrived
+    cand = _store_from_arrays(tmp_path / "cand", inp, [ref.assemble(f.frame_id) for f in ref.manifest.frames], w,
+                              skip_tiles={(1, 1)})
+    rep = w.compare(inp, ref, cand)
+    assert rep.passed, rep.table()
+    assert rep.missing_input_tiles == {0: 1, 1: 1}
+    t = rep.totals()
+    assert t["all"].cells == 2 * (40 * 30 - 100)                    # the missing tile's cells are left out
+    assert t["near_missing_tile"].cells > 0 and t["near_missing_tile"].nodata_only_candidate == 0
+    # NES emits the missing positions too (FILLED, from the neighbours): then they are compared
+    full = _store_from_arrays(tmp_path / "full", inp, [ref.assemble(f.frame_id) for f in ref.manifest.frames], w)
+    rep = w.compare(inp, ref, full)
+    assert rep.passed and not rep.missing_input_tiles and rep.totals()["all"].cells == 2 * 40 * 30
+
+
+def test_multiplicity_problems_fail_the_comparison(setup):
+    tmp, inp, ref, w = setup
+    cand = _store_from_arrays(tmp / "cand", inp, [ref.assemble(f.frame_id) for f in ref.manifest.frames], w)
+    m = cand.manifest
+    m.provenance["nes"] = {"multiplicity_problems": ["frame 0: 3 tile(s) emitted 1x, expected 2x"]}
+    m.save(cand.backend)
+    rep = w.compare(inp, ref, TileStore.open(tmp / "cand"))
+    assert not rep.passed and any("multiplicity" in p for p in rep.coverage_problems)

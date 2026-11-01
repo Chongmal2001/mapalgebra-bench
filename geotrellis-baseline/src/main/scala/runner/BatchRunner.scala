@@ -1,6 +1,6 @@
 package de.tuberlin.dima.geotrellisbaseline.runner
 
-import de.tuberlin.dima.geotrellisbaseline.focal.FocalEngine
+import de.tuberlin.dima.geotrellisbaseline.focal.{FocalEngine, Workers}
 import de.tuberlin.dima.geotrellisbaseline.tilestore.{TileStore, TileStoreWriter}
 
 /** GeoTrellis' layer-level focal path over every frame, one frame = one window (`FocalEngine`): tiles buffered with
@@ -18,10 +18,11 @@ object BatchRunner {
     val bounds = FocalEngine.layerBounds(m.tiling.tiles_x, m.tiling.tiles_y)
     Main.checkHeap(m.frames.map(_.nbytes).max, 4, log)
     val writer = new TileStoreWriter(args.out, store)
+    val workers = new Workers(args.threads)
     val timings = m.frames.toVector.map { info =>
       val prepared = FocalEngine.prepare(store.readFrame(info))
       val t0 = System.nanoTime()
-      val result = FocalEngine.compute(prepared, w, bounds)
+      val result = FocalEngine.compute(prepared, w, bounds, workers)
       val t1 = System.nanoTime()
       writer.writeFrame(info, prepared.keys.size, FocalEngine.toRecords(prepared, result))
       val t = Main.FrameTiming(info.frame_id, prepared.keys.size, m.raster.bands,
@@ -29,6 +30,7 @@ object BatchRunner {
       log(f"frame ${t.frameId}: ${t.tiles} tiles x ${t.bands} band(s), compute ${t.computeNanos / 1e6}%.1f ms")
       t
     }
+    workers.close()
     Main.finish(writer, args, timings)
     timings
   }

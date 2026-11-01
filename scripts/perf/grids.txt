@@ -1,0 +1,21 @@
+# Performance grids (benchmark-design.md §4.4), run by scripts/perf/grid.sh: GRIDS="G1 G4" selects. Syntax:
+# scripts/lib/plan.py. Every combination of the comma lists is one measured configuration (REPS runs per system,
+# systems alternating); a NES passthrough runs once per store, frames per window and thread count.
+# id  stores                ops:shapes:radii              settings (environment of scripts/perf/run.sh)
+
+# G1 main grid: kernel classes, shape, radius, frames per window (16 f/w needs the 16-frame store)
+G1    perf                  mean,max:square,circle:1,2,4,8,16   WINDOW_FRAMES=1,4,16
+# G2 threads: NES workers vs threaded GeoTrellis (same thread count, GT_THREADS = PERF_THREADS)
+G2    sub4                  mean,max:square:4,16          PERF_THREADS=1,2,4,8
+# G3 tile size (side note): halo overhead vs per-tile cost
+G3    t64,t128,sub4,t512    mean,max:square:1,16
+# G4 frames: constant per-frame cost justifies frame subsets
+G4    sub2,sub4,sub8,perf   max:square:4
+# G5 instruction set: GeoTrellis with and without SIMD (explains VM vs laptop)
+G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis
+G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis VARIANT=noavx "GT_JAVA_OPTS=-XX:UseAVX=0 -XX:UseSSE=2"
+# G6 latency under paced load (rates in frames/s, set from G1 throughput); NES needs a paced RasterFile source
+G6    perf                  mean,max:square:4,16          WINDOW_FRAMES=1,16 RATE=0.2,0.4 SYSTEMS=geotrellis
+G6    perf                  mean,max:square:4,16          WINDOW_FRAMES=1,16 RATE=0.2,0.4 SYSTEMS=nes REQUIRES=nes-pacing
+# G7 operator-only time from the NES event trace (separate runs: tracing has overhead; check drops in worker.log)
+G7    sub4                  mean,max:square:1,4,16        SYSTEMS=nes NES_EVENT_TRACE=1 VARIANT=trace

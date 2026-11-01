@@ -36,11 +36,12 @@ class FullGridSuite extends AnyFunSuite {
     }
   }
 
-  for (spec <- Seq("mean:square:2", "sum:circle:3", "min:circle:2", "max:square:1", "mean:square:20")) {
-    test(s"full grid equals the definition: focal:$spec") {
+  for (spec <- Seq("mean:square:2", "sum:circle:3", "min:circle:2", "max:square:1", "mean:square:20"); threads <- Seq(1, 3)) {
+    test(s"full grid equals the definition: focal:$spec, $threads thread(s)") {
       val wl = FocalWorkload.parse(s"focal:$spec")
       val out = Files.createTempDirectory("gtb").resolve("out")
-      FullGridRunner.run(Main.Args("fullgrid", Fixtures.path("ramp"), wl, out, verifyInput = true), _ => ())
+      FullGridRunner.run(Main.Args("fullgrid", Fixtures.path("ramp"), wl, out, verifyInput = true, threads = threads,
+                                   stripeRows = 7), _ => ())
       val store = TileStore.open(out)
       val in = TileStore.open(Fixtures.path("ramp")).manifest
       assert(store.manifest.raster == in.raster && store.manifest.tiling == in.tiling)
