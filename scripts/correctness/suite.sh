@@ -6,7 +6,8 @@
 # A run counts as done when its compare report exists (FORCE=1 reruns it), so a suite can be stopped, restarted or
 # extended by further IDs into the same result set. EXPECT=fail / error in a case line: a FAIL / a NES error is the
 # expected outcome. CASES_FILE: other definition file. NES dumps and imported outputs are deleted after each compare,
-# a reference after the last run that needs it (KEEP_REFS=1 keeps them).
+# a reference after the last run that needs it (KEEP_REFS=1 keeps them). Runs execute grouped by store and workload
+# (stable within a group), so at most one reference is on disk at a time.
 # Outcomes: $RESULTS/correctness/outcomes.csv; reports: $RESULTS/correctness/<case>/<store>/<run>.json.
 set -euo pipefail
 source "$(dirname "$0")/../lib/common.sh"
@@ -19,7 +20,7 @@ OUTC="$RESULTS/correctness/outcomes.csv"
 mkdir -p "$RESULTS/correctness"
 [[ -f "$OUTC" ]] || echo "time_utc,case,store,workload,settings,expect,outcome,as_expected" > "$OUTC"
 
-mapfile -t PLAN < <(python "$BENCH_REPO/scripts/lib/plan.py" "$FILE" "$IDS" "${FILTER:-}")
+mapfile -t PLAN < <(python "$BENCH_REPO/scripts/lib/plan.py" "$FILE" "$IDS" "${FILTER:-}" | sort -s -k2,2 -k3,3)
 [[ ${#PLAN[@]} -gt 0 ]] || { echo "no runs for '$IDS' ${FILTER:+(filter $FILTER)}" >&2; exit 2; }
 declare -A LAST_USE
 for i in "${!PLAN[@]}"; do
