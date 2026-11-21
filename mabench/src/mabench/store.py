@@ -43,6 +43,8 @@ class FrameRows:
         self.keys: list[tuple[int, int]] = []
         self._rows: dict[int, list[tuple[int, np.ndarray]]] = {}
         for h, cells in fmt.iter_maplets(self._buf):
+            if h.flags & fmt.FLAG_LATE:      # belongs to an earlier frame
+                continue
             self.keys.append((h.tile_x, h.tile_y))
             self._rows.setdefault(h.tile_y, []).append((h.tile_x, cells))
 
@@ -146,6 +148,10 @@ class TileStore:
                 seen, valid = set(), 0
                 for h, cells in fmt.iter_maplets(buf):
                     key = (h.tile_x, h.tile_y)
+                    if h.flags == fmt.FLAG_LATE:
+                        if h.frame_id >= info.frame_id:
+                            report.problems.append(f"{where}: late maplet {key} names frame {h.frame_id}, not an earlier one")
+                        continue
                     if h.frame_id != 0:
                         report.problems.append(f"{where}: maplet {key} has frame_id {h.frame_id}, files carry 0")
                     if h.flags != 0:

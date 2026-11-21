@@ -2,18 +2,21 @@
 # Throughput of one focal workload at full speed (all frames available at once): NES with a Void sink and the
 # GeoTrellis micro-batch baseline (trigger frame, results discarded), REPS runs each, alternating systems.
 # System nes-passthrough runs the same NES source and sink without the focal window (cost of source and sink);
-# nes-running / nes-kahan run NES with NES_FOCAL_SUMMATION=running / kahan (Sum/Mean on squares, see FocalSpec.hpp).
+# nes runs NES' default kernels (NES_FOCAL_SUMMATION=kahan); nes-exact / nes-running the other Sum / Mean kernels on
+# squares (NES_FOCAL_SUMMATION=exact / running, see FocalSpec.hpp).
 # Afterwards mabench perf-table collects every run under $RESULTS/perf into $RESULTS/perf.csv.
 #
 #   scripts/perf/run.sh STORE WORKLOAD          e.g. scripts/perf/run.sh data/stores/s2-berlin-16 focal:mean:square:3
 #
-# REPS (default 3), SYSTEMS (default "nes geotrellis"; also nes-passthrough, nes-running, nes-kahan), PERF_THREADS (NES worker
+# REPS (default 3), SYSTEMS (default "nes geotrellis"; also nes-passthrough, nes-exact, nes-running), PERF_THREADS (NES worker
 # threads, default 1), GT_THREADS (GeoTrellis kernel threads, default PERF_THREADS),
-# GT_WARMUP (untimed GeoTrellis warm-up frames, default 1), GT_HEAP (sbt, default 4g), WINDOW_FRAMES (frames per tumbling
-# window, default 1; GeoTrellis then triggers per window instead of per frame), GT_CPUSET (taskset cores for GeoTrellis,
+# GT_WARMUP (untimed GeoTrellis warm-up frames, default 1), GT_HEAP (sbt, bench.env: 12g), WINDOW_FRAMES (frames per tumbling
+# window, default 1; GeoTrellis then triggers per window instead of per frame), WINDOW_SLIDE (NES only: sliding window
+# advancing by that many frames; run directory -w<N>s<S>, system name -s<S>), GT_CPUSET (taskset cores for GeoTrellis,
 # default DOCKER_CPUSET, which pins NES), GT_JAVA_OPTS (extra JVM options), VARIANT (suffix of the run directory, e.g.
-# for runs with other JVM options or with NES_EVENT_TRACE=1), RATE (frames/s, paced input; GeoTrellis only until NES
-# has a paced source). WARM_INPUT=1 (default) reads the store into the page cache before each run
+# for runs with other JVM options or with NES_EVENT_TRACE=1), RATE (frames/s, paced input: GeoTrellis --rate; NES
+# source FRAME_INTERVAL_US with its pacing.csv and the FrameLatency sink's frame-latency.csv instead of Void; needs a
+# NES build with both, FEATURES nes-pacing). WARM_INPUT=1 (default) reads the store into the page cache before each run
 # (scripts/lib/warm.sh); NES_WARMUP=1 (default) runs the same query untimed on the store's first frame in the same worker
 # before the timed query (warm-up store <store>-warm1, made once with mabench derive). The worker's resource samples
 # (resources.csv) and its peak RSS / CPU land next to the timed query's status.json.
@@ -27,7 +30,9 @@ STORE="$(realpath "$1")"
 WORKLOAD="$2"
 W="${WORKLOAD#focal:}"; W="${W//:/-}"
 FPW="${WINDOW_FRAMES:-1}"
+SLIDE="${WINDOW_SLIDE:-$FPW}"
 if [[ "$FPW" != 1 ]]; then W="$W-w$FPW"; fi
+if [[ "$SLIDE" != "$FPW" ]]; then W="${W}s$SLIDE"; fi
 RATE="${RATE:-0}"
 if [[ "$RATE" != 0 ]]; then W="$W-rate$RATE"; fi
 PERF="$RESULTS/perf/$(basename "$STORE")/$W"
@@ -59,12 +64,12 @@ status=0
 for k in $(seq 1 "$REPS"); do
   for sys in $SYSTEMS; do
     case "$sys" in
-      nes|nes-passthrough|nes-running|nes-kahan) T="$THREADS"; BUILD="$NES_TYPE"; CPUSET="$DOCKER_CPUSET" ;;
+      nes|nes-passthrough|nes-exact|nes-running) T="$THREADS"; BUILD="$NES_TYPE"; CPUSET="$DOCKER_CPUSET" ;;
       geotrellis) T="${GT_THREADS:-$THREADS}"; BUILD="GT_HEAP=${GT_HEAP:-4g}"; CPUSET="$GT_CPUSET" ;;
       *) echo "error: unknown system $sys" >&2; exit 2 ;;
     esac
-    if [[ "$sys" == nes* && "$RATE" != 0 ]]; then
-      echo "== $sys: paced input (RATE=$RATE) needs a paced RasterFile source in NES; skipped" >&2; continue
+    if [[ "$sys" == geotrellis && "$SLIDE" != "$FPW" ]]; then
+      echo "== geotrellis: no sliding windows in the micro-batch runner (WINDOW_SLIDE=$SLIDE); skipped" >&2; continue
     fi
     D="$PERF/$sys-t$T${VARIANT:+-$VARIANT}/rep$k"
     if [[ -e "$D/meta.json" ]]; then echo "== $sys t$T rep $k exists"; continue; fi
@@ -74,16 +79,21 @@ for k in $(seq 1 "$REPS"); do
     started="$(date -u +%FT%TZ)"
     if [[ "$sys" == nes* ]]; then
       PT=(); if [[ "$sys" == nes-passthrough ]]; then PT=(--passthrough); fi
-      mabench nes-query "$STORE" --workload "$WORKLOAD" --void --yaml --frames-per-window "$FPW" "${PT[@]}" \
-        > "$D/topology.yaml"
-      SUM=exact; case "$sys" in nes-running) SUM=running ;; nes-kahan) SUM=kahan ;; esac
+      SINK=(--void)
+      if [[ "$RATE" != 0 ]]; then
+        IV="$(python -c 'import sys; print(round(1e6 / float(sys.argv[1])))' "$RATE")"
+        SINK=(--latency "$D/frame-latency.csv" --frame-interval-us "$IV" --pacing-log "$D/pacing.csv")
+      fi
+      mabench nes-query "$STORE" --workload "$WORKLOAD" "${SINK[@]}" --yaml --frames-per-window "$FPW" \
+        --slide-frames "$SLIDE" "${PT[@]}" > "$D/topology.yaml"
+      SUM=kahan; case "$sys" in nes-exact) SUM=exact ;; nes-running) SUM=running ;; esac
       export NES_THREADS="$T" NES_FOCAL_SUMMATION="$SUM"
       if ! "$REPO/scripts/nes/worker.sh" start "$D"; then status=1; continue; fi
       ok=1
       if [[ "${NES_WARMUP:-1}" == 1 ]]; then
         mkdir -p "$D/warmup"
-        mabench nes-query "$WARM_STORE" --workload "$WORKLOAD" --void --yaml --frames-per-window "$FPW" "${PT[@]}" \
-          > "$D/warmup/topology.yaml"
+        mabench nes-query "$WARM_STORE" --workload "$WORKLOAD" --void --yaml --frames-per-window "$FPW" \
+          --slide-frames "$SLIDE" "${PT[@]}" > "$D/warmup/topology.yaml"
         NES_WORKER_DIR="$D" "$REPO/scripts/nes/run-query.sh" "$D/warmup/topology.yaml" "$D/warmup" || ok=0
       fi
       if [[ $ok == 1 ]]; then NES_WORKER_DIR="$D" "$REPO/scripts/nes/run-query.sh" "$D/topology.yaml" "$D" || ok=0; fi
@@ -97,7 +107,7 @@ for k in $(seq 1 "$REPS"); do
       fi
     fi
     cat > "$D/meta.json" <<EOF
-{"system": "$sys", "store": "$STORE", "workload": "$WORKLOAD", "threads": $T, "rep": $k, "frames_per_window": $FPW,
+{"system": "$sys", "store": "$STORE", "workload": "$WORKLOAD", "threads": $T, "rep": $k, "frames_per_window": $FPW, "slide_frames": $SLIDE,
  "build": "$BUILD", "cpuset": "$CPUSET", "host": "$(hostname)", "started_utc": "$started",
  "warm_input": ${WARM_INPUT:-1}, "nes_warmup": ${NES_WARMUP:-1}, "gt_warmup_frames": $GT_WARMUP,
  "variant": "${VARIANT:-}", "rate_fps": $RATE, "gt_java_opts": "${GT_JAVA_OPTS:-}", "event_trace": ${NES_EVENT_TRACE:-0}}
@@ -106,18 +116,18 @@ EOF
 done
 
 mabench perf-table "$RESULTS/perf" --out "$RESULTS/perf.csv"
-python - "$RESULTS/perf.csv" "$(basename "$STORE")" "$WORKLOAD" "$FPW" <<'EOF'
+python - "$RESULTS/perf.csv" "$(basename "$STORE")" "$WORKLOAD" "$FPW" "$RATE" <<'EOF'
 import csv, sys, statistics as st
-path, store, w, fpw = sys.argv[1:]
+path, store, w, fpw, rate = sys.argv[1:]
 _, op, shape, r = w.split(":")
 rows = [x for x in csv.DictReader(open(path))
-        if (x["store"], x["op"], x["shape"], x["radius"], x["frames_per_window"]) == (store, op, shape, r, fpw)]
-print(f"{'system':<14}{'threads':>8}{'runs':>6}{'elapsed s':>11}{'Mcells/s':>10}{'CPU s':>8}{'peak RSS MiB':>14}"
-      f"{'used heap MiB':>15}")
+        if (x["store"], x["op"], x["shape"], x["radius"], x["frames_per_window"]) == (store, op, shape, r, fpw)
+        and float(x["rate_fps"] or 0) == float(rate)]
+print(f"{'system':<14}{'threads':>8}{'runs':>6}{'elapsed s':>11}{'Mcells/s':>10}{'CPU s':>8}{'peak RSS MiB':>14}")
 med = lambda g, k: st.median(float(x[k]) for x in g if x[k]) if any(x[k] for x in g) else float("nan")
 for key in sorted({(x["system"], x["threads"]) for x in rows}):
     g = [x for x in rows if (x["system"], x["threads"]) == key]
     print(f"{key[0]:<14}{key[1]:>8}{len(g):>6}{med(g, 'elapsed_s'):>11.2f}{med(g, 'throughput_cells_per_s') / 1e6:>10.1f}"
-          f"{med(g, 'cpu_s'):>8.2f}{med(g, 'peak_rss_bytes') / 2**20:>14.0f}{med(g, 'peak_heap_bytes') / 2**20:>15.0f}")
+          f"{med(g, 'cpu_s'):>8.2f}{med(g, 'peak_rss_bytes') / 2**20:>14.0f}")
 EOF
 exit $status

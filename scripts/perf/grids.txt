@@ -1,21 +1,43 @@
 # Performance grids (benchmark-design.md §4.4), run by scripts/perf/grid.sh: GRIDS="G1 G4" selects. Syntax:
 # scripts/lib/plan.py. Every combination of the comma lists is one measured configuration (REPS runs per system,
-# systems alternating); a NES passthrough runs once per store, frames per window and thread count.
+# systems alternating); a NES passthrough runs once per store, frames per window and thread count. System nes runs
+# NES' default kernels (compensated running sums for square Sum / Mean, exact otherwise); only G1 adds nes-exact and
+# nes-running, the other kernels of square Sum / Mean.
 # id  stores                ops:shapes:radii              settings (environment of scripts/perf/run.sh)
 
-# G1 main grid: kernel classes, shape, radius, frames per window (16 f/w needs the 16-frame store)
-G1    perf                  mean,max:square,circle:1,2,4,8,16   WINDOW_FRAMES=1,4,16
-# G2 threads: NES workers vs threaded GeoTrellis (same thread count, GT_THREADS = PERF_THREADS)
-G2    sub4                  mean,max:square:4,16          PERF_THREADS=1,2,4,8
-# G3 tile size (side note): halo overhead vs per-tile cost
-G3    t64,t128,sub4,t512    mean,max:square:1,16
+# G1 kernel grid: kernel classes, shape, radius, 1 frame per window, on the 4-frame subset (per-frame cost is constant,
+# G4; window size is G8)
+G1    sub4                  mean,max:square,circle:1,2,4,8,16
+# G1 NES kernels for square Mean: exact and plain running next to the default (nes, line above)
+G1    sub4                  mean:square:1,2,4,8,16        "SYSTEMS=nes-exact nes-running"
+# G2 threads: NES workers vs threaded GeoTrellis (same thread count, GT_THREADS = PERF_THREADS); trim to the machine's
+# cores with FILTER="PERF_THREADS=1,2,4,8", and make sure DOCKER_CPUSET / GT_CPUSET (pinning) allow that many cores
+G2    sub4                  mean,max:square,circle:4,16   PERF_THREADS=1,2,4,8,16
+# G3 tile size, NES only: per-tile cost (tuples, frame-state slots, output tasks, probe tasks) falls with T, halo copy
+# ((T + 2r) / T)^2 falls with T, parallelism and emission granularity fall with T; expected U-shaped cost. Same 4 scenes.
+# Compensated mean isolates tiling cost (kernel independent of r); exact max shows how kernel cost dilutes it
+G3    halo4,t32,t64,t128,sub4,t512,t1024  mean,max:square:1,16  SYSTEMS=nes
 # G4 frames: constant per-frame cost justifies frame subsets
 G4    sub2,sub4,sub8,perf   max:square:4
 # G5 instruction set: GeoTrellis with and without SIMD (explains VM vs laptop)
 G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis
 G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis VARIANT=noavx "GT_JAVA_OPTS=-XX:UseAVX=0 -XX:UseSSE=2"
-# G6 latency under paced load (rates in frames/s, set from G1 throughput); NES needs a paced RasterFile source
-G6    perf                  mean,max:square:4,16          WINDOW_FRAMES=1,16 RATE=0.2,0.4 SYSTEMS=geotrellis
-G6    perf                  mean,max:square:4,16          WINDOW_FRAMES=1,16 RATE=0.2,0.4 SYSTEMS=nes REQUIRES=nes-pacing
+# G6 latency under paced load, 16 frames. Rates shared by both systems, about 50 % and 85-90 % of the slower system's
+# capacity on this store (VM, 1 thread): max r4 GeoTrellis ~0.038 frames/s (26 s per frame from frame 6 on), mean r4
+# NES exact ~0.29 frames/s. NES part needs a build with the paced source and the FrameLatency sink (FEATURES=nes-pacing)
+G6    perf                  max:square:4                  WINDOW_FRAMES=1,4,16 RATE=0.02,0.03 SYSTEMS=geotrellis
+G6    perf                  max:square:4                  WINDOW_FRAMES=1,4,16 RATE=0.02,0.03 SYSTEMS=nes REQUIRES=nes-pacing
+G6    perf                  mean:square:4                 WINDOW_FRAMES=1,4,16 RATE=0.15,0.25 SYSTEMS=geotrellis
+G6    perf                  mean:square:4                 WINDOW_FRAMES=1,4,16 RATE=0.15,0.25 SYSTEMS=nes REQUIRES=nes-pacing
 # G7 operator-only time from the NES event trace (separate runs: tracing has overhead; check drops in worker.log)
 G7    sub4                  mean,max:square:1,4,16        SYSTEMS=nes NES_EVENT_TRACE=1 VARIANT=trace
+# G8 window size at full speed, on the 16-frame store (16 down to 1 windows): throughput, peak and mean memory. Focal
+# results do not depend on the window; what changes is how long state is held (NES eager eviction vs GeoTrellis holding
+# the window's frames) and, for sliding windows (NES only), how often each output is emitted (size / slide times)
+G8    perf                  mean,max:square:4             WINDOW_FRAMES=1,2,4,8,16 "SYSTEMS=nes geotrellis"
+G8    perf                  max:square:4                  WINDOW_FRAMES=4 WINDOW_SLIDE=1,2 SYSTEMS=nes
+# G9 first output vs source buffer size (paced, as G6 Mean at 0.25 frames/s, whose 4 KiB default is the third point):
+# the operator sees a frame's maplets buffer by buffer (operator_buffer_size / 32 maplets per buffer), so the first
+# output of a frame should come after about one buffer, i.e. eager emission within a frame
+G9    perf                  mean:square:4                 RATE=0.25 SYSTEMS=nes REQUIRES=nes-pacing VARIANT=buf1024 "NES_WORKER_ARGS=--worker.default_query_execution.operator_buffer_size=1024"
+G9    perf                  mean:square:4                 RATE=0.25 SYSTEMS=nes REQUIRES=nes-pacing VARIANT=buf2048 "NES_WORKER_ARGS=--worker.default_query_execution.operator_buffer_size=2048"

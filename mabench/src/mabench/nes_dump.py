@@ -146,8 +146,14 @@ def _maplet_bytes(fh: BinaryIO, rec: DumpRecord) -> bytes:
 
 def import_nes(dump_path: str, input_store: TileStore, workload, out_location: str, src_id: int | None = None,
                provenance: dict[str, Any] | None = None, progress: Callable[[str], None] | None = None,
-               windows_per_frame: int | None = None) -> tuple[Manifest, ImportReport]:
-    """Turn a NES dump into an output store on the input's raster and tiling (``bench-capabilities.md`` §9.1)."""
+               windows_per_frame: int | None = None, frames_per_window: int | None = None,
+               slide_frames: int | None = None) -> tuple[Manifest, ImportReport]:
+    """Turn a NES dump into an output store on the input's raster and tiling (``bench-capabilities.md`` §9.1).
+
+    ``windows_per_frame``: every tile must be emitted that often. ``frames_per_window`` / ``slide_frames`` (as given
+    to ``nes_query``): the expected count per frame from the window definition instead, i.e. the number of windows that
+    contain the frame's event time; NES creates no window that starts before time 0 (``SliceAssigner``), so frames
+    earlier than one window size are in fewer windows."""
     if getattr(workload, "output_kind", None) is None or workload.output_kind.value != "raster":
         raise ValueError(f"import-nes needs a workload with raster output (focal), not {workload.name}")
     mi = input_store.manifest
@@ -230,11 +236,14 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
             for n in copies.values():
                 hist[n] = hist.get(n, 0) + 1
             report.multiplicity[fid] = dict(sorted(hist.items()))
-            if windows_per_frame is not None:
+            want = windows_per_frame
+            if frames_per_window is not None:
+                size, slide = window_ms(input_store, frames_per_window, slide_frames)
+                want = windows_containing(frames_by_id[fid].event_time_ms, size, slide)
+            if want is not None:
                 for n, count in sorted(hist.items()):
-                    if n != windows_per_frame:
-                        report.multiplicity_problems.append(
-                            f"frame {fid}: {count} tile(s) emitted {n}x, expected {windows_per_frame}x")
+                    if n != want:
+                        report.multiplicity_problems.append(f"frame {fid}: {count} tile(s) emitted {n}x, expected {want}x")
             present = [k for k in expected if k in placed]
             missing = [list(k) for k in expected if k not in placed]
             if missing:
@@ -298,19 +307,48 @@ DUMP_SCHEMA = (("srcId", "UINT32"), ("srcFrameId", "UINT32"), ("ts", "UINT64"), 
 SOURCE_SCHEMA = (("ts", "UINT64"), ("srcId", "UINT32"), ("srcFrameId", "UINT32"), ("raster", "VARSIZED"))
 
 
+def window_ms(store: TileStore, frames_per_window: int = 1, slide_frames: int | None = None) -> tuple[int, int]:
+    """(size, slide) in ms of the window ``nes_query`` writes: frames_per_window / slide_frames event-time steps, step =
+    the smallest gap between frame event times."""
+    times = sorted(f.event_time_ms for f in store.manifest.frames)
+    steps = [b - a for a, b in zip(times, times[1:]) if b > a]
+    step = min(steps) if steps else 1000
+    return step * frames_per_window, step * (slide_frames or frames_per_window)
+
+
+def windows_containing(t: int, size: int, slide: int) -> int:
+    """Number of windows [k * slide, k * slide + size), k >= 0, that contain t."""
+    return t // slide - max(0, (t - size) // slide + 1) + 1
+
+
+def duration(ms: int) -> str:
+    """Window length for NES SQL in the largest unit that divides it exactly. The parser reads the number with
+    ``std::stoi``, so it must stay below 2^31 (2,147,483,647 ms = 24.8 days); 8 frames of the 5-day S2 revisit are
+    3,456,000,000 ms but 40 DAY."""
+    for unit, size in (("DAY", 86_400_000), ("HOUR", 3_600_000), ("MINUTE", 60_000), ("SEC", 1000), ("MS", 1)):
+        if ms % size == 0 and ms // size < 2 ** 31:
+            return f"{ms // size} {unit}" if unit != "MS" else f"{ms} ms"
+    raise ValueError(f"window of {ms} ms cannot be written for the NES parser (no exact unit below 2^31)")
+
+
 def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "tiles", src_id: int = 1,
               yaml: bool = False, worker: str = "localhost:8080", data_address: str = "localhost:9090",
               store_path: str | None = None, passthrough: bool = False, frames_per_window: int = 1,
-              slide_frames: int | None = None, bands: list[int] | None = None) -> str:
+              slide_frames: int | None = None, latency_path: str | None = None,
+              frame_interval_us: int = 0, pacing_log: str | None = None) -> str:
     """NES statements that run ``workload`` on ``store`` and write the dump ``import-nes`` reads: RasterFile source,
-    one frame per tumbling window (window size = smallest event-time step between frames), the 9 positional
-    ``FOCAL_*`` arguments from the manifest, File sink with output format Binary and the dump schema.
+    one frame per tumbling window (window size = smallest event-time step between frames), grid context from the
+    manifest in the source configuration, ``FOCAL_*(raster, shape, radius)``, File sink with output format Binary and
+    the dump schema.
     ``dump_path=None``: Void sink instead (output discarded; throughput runs).
     ``passthrough=True``: the same source and sink without the focal window (baseline for source and sink cost).
     ``frames_per_window``: tumbling window of that many event-time steps (several frames per window).
     ``slide_frames``: sliding window of ``frames_per_window`` steps advancing by ``slide_frames`` steps (each frame is in
     frames_per_window / slide_frames windows); None or equal to ``frames_per_window`` = tumbling.
-    ``bands``: 1-based band indices; the focal input is ``BANDS(raster, i - 1, ...)`` (NES counts from 0) in a subquery.
+    ``latency_path`` (with ``dump_path=None``): FrameLatency sink instead of Void; the query keeps only ``srcFrameId``
+    and the sink writes, per source frame, when its first and last output arrived (paced runs).
+    ``frame_interval_us`` > 0: paced source, frame k released at t0 + (k - 1) * interval; ``pacing_log``: the
+    source's CSV of scheduled and actual releases (same clock as the FrameLatency sink).
 
     Default: SQL statements for ``nes-repl-embedded``. ``yaml=True``: a topology file for ``nes-cli`` (one worker).
     ``store_path`` overrides the store location as NES sees it (e.g. inside a container)."""
@@ -323,50 +361,61 @@ def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "
         raise ValueError("frames_per_window must be >= 1")
     step = min(steps) if steps else 1000
     window = step * frames_per_window
-    clause = f"TUMBLING(ts, size {window} ms)"
+    clause = f"TUMBLING(ts, size {duration(window)})"
+    assert (window, step * (slide_frames or frames_per_window)) == window_ms(store, frames_per_window, slide_frames)
     if slide_frames is not None and slide_frames != frames_per_window:
         if slide_frames < 1 or frames_per_window % slide_frames:
             raise ValueError("slide_frames must be >= 1 and divide frames_per_window")
-        clause = f"SLIDING(ts, size {window} ms, advance by {step * slide_frames} ms)"
+        clause = f"SLIDING(ts, size {duration(window)}, advance by {duration(step * slide_frames)})"
     r, t = m.raster, m.tiling
     location = store_path or store.backend.location
     location = location if "://" in location or store_path else os.path.abspath(location)
-    call = (f"{NES_OPS[p['op']]}(raster, {NES_SHAPES[p['shape']]}, {p['radius']}, NODATA, nan, "
-            f"{r.width}, {r.height}, {t.tile_size}, {t.tile_size})")
-    inner = source
-    if bands:
-        if any(b < 1 or b > r.bands for b in bands):
-            raise ValueError(f"bands {bands} outside 1..{r.bands}")
-        inner = (f"(SELECT ts, srcId, srcFrameId, BANDS(raster, {', '.join(str(b - 1) for b in bands)}) AS raster "
-                 f"FROM {source})")
+    call = f"{NES_OPS[p['op']]}(raster, {NES_SHAPES[p['shape']]}, {p['radius']})"
+    grid = [("raster_width", r.width), ("raster_height", r.height), ("tile_width", t.tile_size), ("tile_height", t.tile_size)]
     select = [
         "SELECT srcId, srcFrameId, ts, raster FROM (",
         f"    SELECT ts, srcId, srcFrameId, {call} AS raster",
-        f"    FROM {inner} WINDOW {clause}) INTO dump",
+        f"    FROM {source} WINDOW {clause}) INTO dump",
     ]
     if passthrough:
         select = [f"SELECT srcId, srcFrameId, ts, raster FROM {source} INTO dump"]
+    if latency_path is not None:
+        if dump_path is not None:
+            raise ValueError("latency_path and dump_path exclude each other")
+        select[0] = select[0].replace("SELECT srcId, srcFrameId, ts, raster FROM", "SELECT srcFrameId FROM")
+    if frame_interval_us < 0:
+        raise ValueError("frame_interval_us must be >= 0")
+    pacing = [("frame_interval_us", frame_interval_us)] if frame_interval_us else []
+    if pacing and pacing_log:
+        pacing.append(("pacing_log", pacing_log))
+    sink_schema = [("srcFrameId", "UINT32")] if latency_path is not None else DUMP_SCHEMA
     if yaml:
         def fields(schema, indent):
             return [f"{indent}- name: {n}\n{indent}  type: {t}" for n, t in schema]
         return "\n".join([
             f"# mabench nes-query: {workload.name} on {location}",
             "query: |", *("  " + line for line in select), "",
-            "sinks:", "  - name: dump", f"    host: {worker}", "    schema:", *fields(DUMP_SCHEMA, "      "),
-            *(["    type: Void", "    config: {}", ""] if dump_path is None else
+            "sinks:", "  - name: dump", f"    host: {worker}", "    schema:", *fields(sink_schema, "      "),
+            *(["    type: FrameLatency", "    config:", f"      file_path: {latency_path}", ""] if latency_path else
+              ["    type: Void", "    config: {}", ""] if dump_path is None else
               ["    type: File", "    config:", f"      file_path: {dump_path}", "      output_format: Binary", ""]),
             "logical:", f"  - name: {source}", "    schema:", *fields(SOURCE_SCHEMA, "      "), "",
             "physical:", f"  - logical: {source}", f"    host: {worker}", "    parser_config:", "      type: NATIVE",
-            "    type: RasterFile", "    source_config:", f"      file_path: {location}", f"      src_id: {src_id}", "",
+            "    type: RasterFile", "    source_config:", f"      file_path: {location}", f"      src_id: {src_id}",
+            *(f"      {k}: {v}" for k, v in grid + pacing), "",
             "workers:", f"  - host: {worker}", f"    data_address: {data_address}", "    max_operators: 10000", ""])
-    if dump_path is None:
+    if dump_path is None and latency_path is None:
         raise ValueError("the Void sink is only emitted as a nes-cli topology (yaml=True)")
+    sink = ("CREATE SINK dump(srcFrameId UINT32 NOT NULL) "
+            f"TYPE FrameLatency SET('{latency_path}' AS \"SINK\".FILE_PATH);" if latency_path is not None else
+            "CREATE SINK dump(srcId UINT32 NOT NULL, srcFrameId UINT32 NOT NULL, ts UINT64 NOT NULL, raster VARSIZED NOT NULL) "
+            f"TYPE File SET('{dump_path}' AS \"SINK\".FILE_PATH, 'Binary' AS \"SINK\".OUTPUT_FORMAT);")
+    options = "".join(f", {v if isinstance(v, int) else repr(v)} AS \"SOURCE\".{k.upper()}" for k, v in grid + pacing)
     return "\n".join([
         f"CREATE LOGICAL SOURCE {source}(ts UINT64 NOT NULL, srcId UINT32 NOT NULL, srcFrameId UINT32 NOT NULL, "
         "raster VARSIZED NOT NULL);",
         f"CREATE PHYSICAL SOURCE FOR {source} TYPE RasterFile SET('NATIVE' AS INPUT_FORMATTER.\"TYPE\", "
-        f"'{location}' AS \"SOURCE\".FILE_PATH, {src_id} AS \"SOURCE\".SRC_ID);",
-        "CREATE SINK dump(srcId UINT32 NOT NULL, srcFrameId UINT32 NOT NULL, ts UINT64 NOT NULL, raster VARSIZED NOT NULL) "
-        f"TYPE File SET('{dump_path}' AS \"SINK\".FILE_PATH, 'Binary' AS \"SINK\".OUTPUT_FORMAT);",
+        f"'{location}' AS \"SOURCE\".FILE_PATH, {src_id} AS \"SOURCE\".SRC_ID{options});",
+        sink,
         *select[:-1], select[-1] + ";",
     ])

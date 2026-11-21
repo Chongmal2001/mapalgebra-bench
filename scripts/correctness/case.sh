@@ -8,15 +8,15 @@
 #   runs/<case>/<store>/<run>/                  topology.yaml, dump.bin, worker.log, status.json, run.json (NES run)
 #   correctness/<case>/<store>/<run>.json/.png  compare report and error heatmap of the first frame
 # <run> = workload, then -<summation>, -w<frames per window>[s<slide>], -<CASE_TAG> where set.
-# NES_INPUT=STORE2 and NES_BANDS=i,j (1-based): NES reads STORE2 through BANDS(raster, ...); reference, import and
-# compare use STORE (the band subset of STORE2, same frames).
+# NES_INPUT=STORE2: NES reads STORE2 instead of STORE (same frames); reference, import and compare use STORE.
 # REF_SYSTEM=geotrellis (default, sbt run --mode fullgrid, heap GT_HEAP, GT_REF_THREADS threads) or oracle (mabench reference).
 # An existing dump is reused (scripts/clean.sh starts over); NES=0 computes the reference only; KEEP_DUMP=0 deletes the
 # dump after import, KEEP_OUTPUT=0 the imported NES output after compare. NES settings: bench.env / bench.local.env
-# (scripts/nes/run-query.sh). NES_FOCAL_SUMMATION=running|kahan selects the running-sum Sum/Mean kernel (suffix
-# -running / -kahan); WINDOW_FRAMES=N puts N frames into one tumbling window (suffix -wN); WINDOW_SLIDE=S makes it a
-# sliding window advancing by S frames (suffix -wNsS; every output tile must then appear N/S times). The reference is
-# shared.
+# (scripts/nes/run-query.sh). NES_FOCAL_SUMMATION=exact|running|kahan selects the Sum/Mean kernel (default kahan;
+# suffix -running / -kahan, none for exact); WINDOW_FRAMES=N puts N frames into one tumbling window (suffix -wN); WINDOW_SLIDE=S makes it a
+# sliding window advancing by S frames (suffix -wNsS; every output tile must then appear once per window containing
+# its frame, N/S times except for frames in the first window). The reference is shared. PACE_US=N: paced NES source
+# (one frame every N µs, buffers cut at frame boundaries; needs a NES build with pacing); results must not change.
 set -euo pipefail
 
 [[ $# -eq 2 ]] || { sed -n '2,20p' "$0"; exit 2; }
@@ -26,7 +26,7 @@ STORE="$(realpath "$1")"
 WORKLOAD="$2"
 NAME="$(basename "$STORE")"
 W="${WORKLOAD#focal:}"; W="${W//:/-}"
-SUMMATION="${NES_FOCAL_SUMMATION:-exact}"
+SUMMATION="${NES_FOCAL_SUMMATION:-kahan}"
 RUNW="$W"; if [[ "$SUMMATION" != exact ]]; then RUNW="$W-$SUMMATION"; fi
 FPW="${WINDOW_FRAMES:-1}"
 SLIDE="${WINDOW_SLIDE:-$FPW}"
@@ -60,14 +60,14 @@ if [[ -e "$RUN/dump.bin" && -e "$RUN/status.json" ]] && grep -q '"Stopped"' "$RU
 else
   echo "== NES ($WORKLOAD) -> $RUN"
   mabench nes-query "$NES_STORE" --workload "$WORKLOAD" --dump "$RUN/dump.bin" --yaml --frames-per-window "$FPW" \
-          --slide-frames "$SLIDE" ${NES_BANDS:+--bands "$NES_BANDS"} ${NES_STORE_PATH:+--store-path "$NES_STORE_PATH"} \
-          > "$RUN/topology.yaml"
+          --slide-frames "$SLIDE" ${NES_STORE_PATH:+--store-path "$NES_STORE_PATH"} \
+          ${PACE_US:+--frame-interval-us "$PACE_US" --pacing-log "$RUN/pacing.csv"} > "$RUN/topology.yaml"
   "$REPO/scripts/nes/run-query.sh" "$RUN/topology.yaml" "$RUN"
 fi
 
 echo "== import -> $NES_OUT"
 mabench import-nes "$RUN/dump.bin" --input "$STORE" --workload "$WORKLOAD" --out "$NES_OUT" --force \
-  --windows-per-frame $((FPW / SLIDE))
+  --frames-per-window "$FPW" --slide-frames "$SLIDE"
 if [[ "${KEEP_DUMP:-1}" == 0 ]]; then rm -f "$RUN/dump.bin"; fi
 echo "== compare"
 mabench compare "$NES_OUT" --reference "$REF" --input "$STORE" --json "$RES/$RUNW.json" --heatmap "$RES/$RUNW.png"

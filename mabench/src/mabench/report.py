@@ -5,7 +5,8 @@ Inputs: ``perf.csv`` (``mabench perf-table``, one row per run) and the correctne
 
 Aggregation: median over repetitions, min / max as error bars. Throughput = cells / elapsed time, with cells = tiles x
 bands x tile_size^2 for both systems (edge padding included). Older perf.csv files (``wall_s``, ``peak_mem_bytes``)
-are read as ``elapsed_s`` and, per system, ``rss_hwm_bytes`` (NES) or ``peak_heap_bytes`` (GeoTrellis).
+are read as ``elapsed_s`` and, for NES, ``rss_hwm_bytes``. Memory is NES only (worker RSS); GeoTrellis memory is not
+measured. Figures are PNG.
 """
 
 from __future__ import annotations
@@ -18,10 +19,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-SYSTEM_ORDER = ["nes", "nes-running", "nes-kahan", "geotrellis", "nes-passthrough"]
-LABEL = {"nes": "NES (exact)", "nes-running": "NES (running sum)", "nes-kahan": "NES (Kahan)",
+SYSTEM_ORDER = ["nes", "nes-exact", "nes-running", "geotrellis", "nes-passthrough"]
+LABEL = {"nes": "NES", "nes-exact": "NES (exact)", "nes-running": "NES (running sum)",
          "geotrellis": "GeoTrellis micro-batch", "nes-passthrough": "NES source + sink only"}
-STYLE = {"nes": ("#1f4e9c", "o", "-"), "nes-running": ("#4f8fdc", "s", "--"), "nes-kahan": ("#7fb3ef", "D", ":"),
+STYLE = {"nes": ("#1f4e9c", "o", "-"), "nes-exact": ("#7fb3ef", "D", ":"), "nes-running": ("#4f8fdc", "s", "--"),
          "geotrellis": ("#c0392b", "^", "-"), "nes-passthrough": ("#7f7f7f", "", ":")}
 CASE = re.compile(r"^(?P<op>[a-z]+)-(?P<shape>[a-z]+)-(?P<r>\d+)(?:-(?P<mode>running|kahan))?"
                   r"(?:-w(?P<w>\d+)(?:s(?P<s>\d+))?)?(?:-(?P<tag>[A-Za-z0-9_]+))?$")
@@ -31,14 +32,16 @@ CASE = re.compile(r"^(?P<op>[a-z]+)-(?P<shape>[a-z]+)-(?P<r>\d+)(?:-(?P<mode>run
 
 def load_perf(path: str | Path) -> list[dict[str, Any]]:
     num = {"threads", "rep", "frames", "frames_per_window", "radius", "cells", "bands", "tile_size"}
-    flt = {"rate_fps", "task_s", "trace_dropped", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms", "elapsed_s", "compute_s", "buffer_s", "gc_s", "cpu_s", "throughput_cells_per_s", "cells_per_cpu_s",
-           "peak_rss_bytes", "mean_rss_bytes", "rss_hwm_bytes", "peak_heap_bytes"}
+    flt = {"rate_fps", "task_s", "trace_dropped", "latency_p50_ms", "latency_p95_ms", "latency_p99_ms",
+           "frame_latency_p50_ms", "frame_latency_p95_ms", "frame_latency_p99_ms", "ttfo_p50_ms", "ttfo_p95_ms",
+           "release_lag_max_ms", "elapsed_s", "compute_s", "buffer_s", "gc_s", "cpu_s", "throughput_cells_per_s", "cells_per_cpu_s",
+           "peak_rss_bytes", "mean_rss_bytes", "rss_hwm_bytes"}
     rows = []
     for r in csv.DictReader(open(path, newline="")):
         if "elapsed_s" not in r:                                   # perf.csv before the rename
             r["elapsed_s"] = r.get("wall_s")
-            legacy = "peak_heap_bytes" if r.get("mem_kind") == "jvm_heap_used" else "rss_hwm_bytes"
-            r[legacy] = r.get("peak_mem_bytes")
+            if r.get("mem_kind") != "jvm_heap_used":
+                r["rss_hwm_bytes"] = r.get("peak_mem_bytes")
         for k in num:
             r[k] = int(r[k]) if r.get(k) not in (None, "") else None
         for k in flt:
@@ -185,7 +188,7 @@ def speedup_figure(rows, store, shape, out, formats, threads=1) -> list[Path]:
     fig, axes = _grid(plt, 1, len(ops))
     for j, op in enumerate(ops):
         ax = axes[0][j]
-        for sys in ("nes", "nes-running", "nes-kahan"):
+        for sys in ("nes", "nes-exact", "nes-running"):
             for fpw, ls in zip(fpws, ("-", "--", ":", "-.")):
                 pts = []
                 for k, v in sorted(agg.items()):
@@ -282,44 +285,31 @@ def breakdown_figure(rows, store, shape, op, out, formats) -> list[Path]:
 
 
 def memory_figure(rows, store, shape, out, formats) -> list[Path]:
-    """Peak memory per system and frames per window (median over radii and reps). Left: process RSS inside the measured
-    span (VmHWM over the process's life where no samples exist). Right: GeoTrellis' used heap. RSS includes NES' buffer
-    pool and the JVM's whole (pre-touched) heap, so the right panel shows what GeoTrellis actually holds."""
+    """Peak NES worker RSS per system variant and frames per window (median over radii and reps), inside the measured
+    span (VmHWM over the worker's life where no samples exist). Includes the preallocated buffer pool; passthrough shows
+    that floor."""
     plt = _plt()
-    sel = [r for r in rows if r["store"] == store and r["shape"] == shape]
+    sel = [r for r in rows if r["store"] == store and r["shape"] == shape and r["system"].startswith("nes")]
     rss: dict[tuple, list[float]] = defaultdict(list)
-    heap: dict[int, list[float]] = defaultdict(list)
     for r in sel:
         v = r.get("peak_rss_bytes") or r.get("rss_hwm_bytes")
         if v:
             rss[(r["system"], r["frames_per_window"])].append(v / 2**30)
-        if r["system"] == "geotrellis" and r.get("peak_heap_bytes"):
-            heap[r["frames_per_window"]].append(r["peak_heap_bytes"] / 2**30)
-    if not rss and not heap:
+    if not rss:
         return []
     systems = [s for s in SYSTEM_ORDER if any(k[0] == s for k in rss)]
-    fpws = sorted({k[1] for k in rss} | set(heap))
-    colors = ["#1f4e9c", "#c0392b", "#7fb3ef", "#f2b8b0"]
-    if heap:
-        fig, (ax, ax2) = plt.subplots(1, 2, figsize=(1.6 * len(systems) + 4.5, 3.4),
-                                      gridspec_kw={"width_ratios": [max(1, len(systems)), 1]})
-    else:
-        fig, ax = plt.subplots(figsize=(1.6 * len(systems) + 2, 3.4))
-        ax2 = None
+    fpws = sorted({k[1] for k in rss})
+    colors = ["#1f4e9c", "#4f8fdc", "#7fb3ef", "#bcd6f5", "#7f7f7f"]
+    fig, ax = plt.subplots(figsize=(1.6 * len(systems) + 2, 3.4))
     w = 0.8 / len(fpws)
     for i, fpw in enumerate(fpws):
         off = (i - (len(fpws) - 1) / 2) * w
         vals = [st.median(rss.get((s, fpw), [float("nan")])) for s in systems]
-        ax.bar([x + off for x in range(len(systems))], vals, w, label=f"{fpw} frame(s)/window", color=colors[i % 4])
-        if ax2 is not None:
-            ax2.bar([off], [st.median(heap.get(fpw, [float("nan")]))], w, color=colors[i % 4])
+        ax.bar([x + off for x in range(len(systems))], vals, w, label=f"{fpw} frame(s)/window", color=colors[i % 5])
     ax.set_xticks(range(len(systems)), [LABEL[s].replace(" ", "\n", 1) for s in systems], fontsize=7)
     ax.set_ylabel("peak RSS (GiB)")
-    ax.set_title(f"Peak process RSS ({store})")
+    ax.set_title(f"Peak NES worker RSS ({store})")
     ax.legend(fontsize=7)
-    if ax2 is not None:
-        ax2.set_xticks([0], ["GeoTrellis\nused heap"], fontsize=7)
-        ax2.set_ylabel("peak used heap (GiB)")
     fig.tight_layout()
     paths = _save(fig, out, f"memory_{store}_{shape}", formats)
     plt.close(fig)
@@ -327,27 +317,22 @@ def memory_figure(rows, store, shape, out, formats) -> list[Path]:
 
 
 def _span_and_samples(run_dir: Path) -> tuple[int, int, list] | None:
-    """(t0_us, t1_us, samples) of one run: NES status.json + resources.csv, GeoTrellis summary.json + resources.csv."""
+    """(t0_us, t1_us, samples) of one NES run: status.json + resources.csv."""
     from .perf import read_resources
     samples = read_resources(run_dir / "resources.csv")
-    if not samples:
+    if not samples or not (run_dir / "status.json").exists():
         return None
-    if (run_dir / "status.json").exists():
-        s = json.loads((run_dir / "status.json").read_text())
-        s = next((e for e in s if "local_query_id" in e), s[0]) if isinstance(s, list) else s
-        return s["running"]["since_epoch"], s["stopped"]["since_epoch"], samples
-    if (run_dir / "summary.json").exists():
-        s = json.loads((run_dir / "summary.json").read_text())
-        if "span_start_us" in s:
-            return s["span_start_us"], s["span_end_us"], samples
-    return None
+    s = json.loads((run_dir / "status.json").read_text())
+    s = next((e for e in s if "local_query_id" in e), s[0]) if isinstance(s, list) else s
+    return s["running"]["since_epoch"], s["stopped"]["since_epoch"], samples
 
 
 def timeline_figure(rows, store, shape, op, out, formats) -> list[Path]:
-    """RSS over time of one run per system (largest frames per window, radius closest to 4, first repetition),
-    time 0 = start of the measured span. Shows bounded NES state vs GeoTrellis' per-batch pattern."""
+    """NES worker RSS over time of one run per system variant (largest frames per window, radius closest to 4, first
+    repetition), time 0 = start of the measured span. Bounded state: no growth with the frames processed."""
     plt = _plt()
-    sel = [r for r in rows if r["store"] == store and r["shape"] == shape and r["op"] == op and r.get("run_dir")]
+    sel = [r for r in rows if r["store"] == store and r["shape"] == shape and r["op"] == op and r.get("run_dir")
+           and r["system"].startswith("nes")]
     if not sel:
         return []
     fpw = max(r["frames_per_window"] for r in sel)
@@ -375,7 +360,7 @@ def timeline_figure(rows, store, shape, op, out, formats) -> list[Path]:
     ax.axvline(0, color="black", lw=0.6)
     ax.set_xlabel("time since start of measured span (s); dotted = end")
     ax.set_ylabel("RSS (GiB)")
-    ax.set_title(f"Memory over time, {op} {shape} r={radius}, {fpw} frame(s)/window ({store})")
+    ax.set_title(f"NES worker RSS over time, {op} {shape} r={radius}, {fpw} frame(s)/window ({store})")
     ax.legend(fontsize=7)
     fig.tight_layout()
     paths = _save(fig, out, f"timeline_{store}_{op}_{shape}", formats)
@@ -454,12 +439,14 @@ def paced_markdown(rows) -> str:
     for r in rows:
         groups[(r["store"], r["op"], r["shape"], r["radius"], r["frames_per_window"], r["system"], r["threads"],
                 r["rate_fps"])].append(r)
-    lines = ["| store | op | shape | r | frames/window | system | threads | rate (frames/s) | runs | latency p50 ms | p95 | p99 |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    cols = [("window latency p50 ms", "latency_p50_ms"), ("p95", "latency_p95_ms"), ("p99", "latency_p99_ms"),
+            ("frame latency p50 ms", "frame_latency_p50_ms"), ("p95", "frame_latency_p95_ms"),
+            ("first output p50 ms", "ttfo_p50_ms"), ("p95", "ttfo_p95_ms"), ("max release lag ms", "release_lag_max_ms")]
+    head = "| store | op | shape | r | frames/window | system | threads | rate (frames/s) | runs | "
+    lines = [head + " | ".join(h for h, _ in cols) + " |", "|" + "---|" * (9 + len(cols))]
     med = lambda g, k: f"{st.median(x[k] for x in g if x.get(k) is not None):.1f}" if any(x.get(k) is not None for x in g) else ""
     for k, g in sorted(groups.items()):
-        lines.append(f"| {' | '.join(str(v) for v in k)} | {len(g)} | {med(g, 'latency_p50_ms')} | "
-                     f"{med(g, 'latency_p95_ms')} | {med(g, 'latency_p99_ms')} |")
+        lines.append(f"| {' | '.join(str(v) for v in k)} | {len(g)} | " + " | ".join(med(g, c) for _, c in cols) + " |")
     return "\n".join(lines)
 
 
@@ -477,7 +464,7 @@ def correctness_markdown(crows) -> str:
 
 
 def report(perf_csv: str | Path | None, results: str | Path | None, out: str | Path,
-           formats: tuple[str, ...] = ("png", "pdf"), breakdown_op: str = "max") -> list[Path]:
+           formats: tuple[str, ...] = ("png",), breakdown_op: str = "max") -> list[Path]:
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     formats = list(formats)

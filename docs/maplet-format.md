@@ -39,7 +39,7 @@ Metadata lives on three levels. Anything raster-level is stored **once**, never 
 - **NoData:** NaN in every benchmark store. The maplet's `noData` field must be NaN. A NaN cell is NoData regardless of its payload bits.
 - **Cell layout:** band-major; within a band row-major (row 0 left to right, then row 1, …). The cell (b, r, c) is at index `b·H·W + r·W + c`.
 - **Alignment:** every preamble size is a multiple of 8, so cells can be viewed in place as `double[]`.
-- **Tile order in a frame:** row-major by tile (`tile_y` ascending, then `tile_x` ascending).
+- **Tile order in a frame:** row-major by tile (`tile_y` ascending, then `tile_x` ascending) as the tiler writes it. Readers take positions from the preamble and accept any order; `mabench derive --shuffle-tiles SEED` writes a seeded random order (manifest `tile_order: "shuffled"`, correctness case K11).
 - **Completeness:** every frame file contains every tile of the grid exactly once (tiles_x · tiles_y tiles). Missing tiles appear only in NES output or in tests.
 - **Padding:** every tile is the full T × T. Cells outside the raster extent (right/bottom edge tiles) are NaN. The true extent is `manifest.raster.width/height`.
 - **Tile shape is uniform:** every maplet of a store has the same bands, height and width. Consequence: fixed record size, so record *i* starts at a computable offset.
@@ -204,8 +204,10 @@ tiles_x = ceil(W / T_w) and tiles_y = ceil(H / T_h) are derived, not stored.
 +0   u8   format         = 3                      parse: version dispatch
 +1   u8   cellType       = 1 (Float64)            parse: bytes per cell
 +2   u8   bands          1..255                   shape (changes through BANDS)
-+3   u8   flags          bit 0 = tile filled with NoData by an operator (not observed data)
-+4   u32  frame_id       0 in files (= unassigned); written by the NES source / frame-emitting operators (see 5.4)
++3   u8   flags          bit 0 = tile filled with NoData by an operator (not observed data); bit 1 = LATE (files only)
++4   u32  frame_id       0 in files (= unassigned), or with LATE the header frame_id of the earlier frame the maplet
+                         belongs to (the source emits it with that frame's event time and clears the flag); written by
+                         the NES source / frame-emitting operators (see 5.4)
 +8   i32  tile_x         0 ≤ tile_x < tiles_x     place
 +12  i32  tile_y         0 ≤ tile_y < tiles_y     place
 +16  u32  height         = T_h                    shape

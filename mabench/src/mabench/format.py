@@ -65,6 +65,7 @@ MAX_BANDS = 255
 NODATA = float("nan")
 CELL_DTYPE = np.dtype("<f8")
 FLAG_FILLED = 0x01                   # maplet synthesised by an operator (NoData fill), not observed data
+FLAG_LATE = 0x02                     # tile stores only: maplet of an earlier frame (named by frame_id), arriving late
 IDENTITY_TRANSFORM = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
 

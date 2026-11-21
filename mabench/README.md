@@ -97,7 +97,7 @@ is self-describing.
 ### Frame file and manifest (record version 4)
 
 A frame file is a 112-byte frame header (`MPLFRM04`: frame id, tile count, event time, raster and tile size, bands,
-NoData = NaN, CRS EPSG, transform) followed by one NES `MapletCodec` format-3 maplet per tile in row-major order: a
+NoData = NaN, CRS EPSG, transform) followed by one NES `MapletCodec` format-3 maplet per tile, in row-major order unless derived with `--shuffle-tiles`: a
 32-byte self-locating preamble (format 3, cellType, bands, flags, `frame_id` = 0 in files, tile_x, tile_y, height,
 width, raster width and height) plus float64 cells, band-major. Edge tiles are padded to the full tile size with NaN.
 The manifest (`record_version: 4`) holds the raster block, the tiling, one entry per frame (key, tile count, size,

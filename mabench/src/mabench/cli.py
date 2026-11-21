@@ -2,7 +2,7 @@
 
   mabench prepare   raster file(s) -> tile store (one file per frame)
   mabench synth     synthetic raster -> tile store
-  mabench derive    store -> store: frame subset, bands, rescale, injected NoData, removed tiles
+  mabench derive    store -> store: frame subset, bands, rescale, injected NoData, removed / late tiles, shuffled order
   mabench inspect   print a store's manifest summary
   mabench verify    checksums, completeness, padding (exit 1 on problems)
   mabench workload  write workload.json for NES / GeoTrellis
@@ -11,7 +11,7 @@
   mabench nes-query  NES statements that run a workload on a store and write a Binary dump
   mabench import-nes NES Binary dump -> candidate output store
   mabench perf-table throughput runs (scripts/perf/run.sh) -> one CSV row per run
-  mabench report    figures (PNG/PDF) and markdown tables from perf.csv and compare reports
+  mabench report    figures (PNG) and markdown tables from perf.csv and compare reports
 """
 
 from __future__ import annotations
@@ -128,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--force", action="store_true")
 
     p = sub.add_parser("derive", help="derive a store: frame subset, band selection, rescale, injected NoData, "
-                                      "removed tiles (see mabench.derive)")
+                                      "removed / late tiles, shuffled tile order (see mabench.derive)")
     p.add_argument("store")
     p.add_argument("--out", required=True)
     p.add_argument("--frames", help="input positions: a:b (slice) or 0,2,5; frames are renumbered 0..n-1")
@@ -139,7 +139,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="inject NoData in derived frame F (or *): fraction=P | block=X0,Y0,W,H | tile=X,Y")
     p.add_argument("--drop-tiles", action="append", default=[], metavar="F:SPEC",
                    help="leave tiles out of derived frame F (or *): X,Y | row=Y | col=X")
+    p.add_argument("--late-tiles", action="append", default=[], metavar="F:X,Y@G",
+                   help="move tile (X, Y) of derived frame F to the end of frame G > F, flagged late")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--shuffle-tiles", type=int, metavar="SEED",
+                   help="write the maplets of every frame in a random order (seeded per frame)")
     p.add_argument("--force", action="store_true")
 
     p = sub.add_parser("inspect", help="print a store's manifest summary")
@@ -177,6 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--dump", help="path the NES File sink writes to (absolute, as NES sees it)")
     g.add_argument("--void", action="store_true", help="Void sink instead of the dump (throughput runs; needs --yaml)")
+    g.add_argument("--latency", help="FrameLatency sink writing first / last output time per source frame to this path "
+                                     "(paced runs; as NES sees it)")
+    p.add_argument("--frame-interval-us", type=int, default=0,
+                   help="paced source: frame k released at t0 + (k - 1) * interval (default 0: unpaced)")
+    p.add_argument("--pacing-log", help="paced source: CSV of scheduled and actual release per frame (as NES sees it)")
     p.add_argument("--source", default="tiles", help="logical source name")
     p.add_argument("--src-id", type=int, default=1)
     p.add_argument("--yaml", action="store_true", help="write a nes-cli topology file instead of SQL statements")
@@ -186,7 +195,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--passthrough", action="store_true", help="source -> sink without the focal window (baseline)")
     p.add_argument("--frames-per-window", type=int, default=1,
                    help="tumbling window size in event-time steps between frames (default 1: one frame per window)")
-    p.add_argument("--bands", help="1-based band indices read through BANDS(raster, ...) before focal, e.g. 3,1")
     p.add_argument("--slide-frames", type=int,
                    help="sliding window: advance in event-time steps (divides --frames-per-window; default: tumbling)")
 
@@ -199,8 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--src-id", type=int, help="require every record to carry this srcId "
                                               "(default: all records must share one srcId)")
     p.add_argument("--windows-per-frame", type=int,
-                   help="expected copies of every output tile (1 tumbling, size/slide sliding); others are reported "
-                        "as multiplicity problems, which compare counts as coverage problems")
+                   help="expected copies of every output tile; others are reported as multiplicity problems, which "
+                        "compare counts as coverage problems")
+    p.add_argument("--frames-per-window", type=int,
+                   help="window of the query (as for nes-query): expected copies per frame = windows containing it")
+    p.add_argument("--slide-frames", type=int, help="slide of the query's window (as for nes-query)")
     p.add_argument("--force", action="store_true")
 
     p = sub.add_parser("perf-table", help="collect throughput runs (scripts/perf/run.sh) into one CSV, one row per run")
@@ -211,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--perf", default="data/results/perf.csv", help="perf.csv of mabench perf-table")
     p.add_argument("--results", default="data/results", help="directory with <store>/<case>.json compare reports")
     p.add_argument("--out", default="data/results/report")
-    p.add_argument("--format", default="png,pdf", help="comma-separated: png, pdf, svg")
+    p.add_argument("--format", default="png", help="comma-separated: png, pdf, svg")
     p.add_argument("--breakdown-op", default="max", help="op shown in the time-breakdown figure")
 
     args = ap.parse_args(argv)
@@ -237,7 +248,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             m = derive(TileStore.open(args.store), args.out, args.frames,
                        [int(b) for b in args.bands.split(",")] if args.bands else None, args.scale, args.offset,
-                       args.nan, args.drop_tiles, args.seed, _provenance(argv), say)
+                       args.nan, args.drop_tiles, args.seed, _provenance(argv), say, args.shuffle_tiles,
+                       args.late_tiles)
         except ValueError as exc:
             raise SystemExit(f"derive: {exc}")
         say(f"wrote {len(m.frames)} frame(s), {m.raster.bands} band(s), to {args.out}")
@@ -296,11 +308,10 @@ def main(argv: list[str] | None = None) -> int:
         w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
         if args.void and not args.yaml:
             raise SystemExit("nes-query: --void needs --yaml")
-        print(nes_query(TileStore.open(args.store), w, None if args.void else args.dump, args.source, args.src_id, yaml=args.yaml,
+        print(nes_query(TileStore.open(args.store), w, args.dump, args.source, args.src_id, yaml=args.yaml,
                         worker=args.worker, data_address=args.data_address, store_path=args.store_path,
                         passthrough=args.passthrough, frames_per_window=args.frames_per_window,
-                        slide_frames=args.slide_frames,
-                        bands=[int(b) for b in args.bands.split(",")] if args.bands else None))
+                        slide_frames=args.slide_frames, latency_path=args.latency, frame_interval_us=args.frame_interval_us, pacing_log=args.pacing_log))
     elif args.cmd == "import-nes":
         from .nes_dump import import_nes
         _refuse_existing(args.out, args.force)
@@ -308,7 +319,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             m, report = import_nes(args.dump, TileStore.open(args.input), w, args.out, src_id=args.src_id,
                                    provenance=_provenance(argv), progress=say,
-                                   windows_per_frame=args.windows_per_frame)
+                                   windows_per_frame=args.windows_per_frame,
+                                   frames_per_window=args.frames_per_window, slide_frames=args.slide_frames)
         except ValueError as exc:
             raise SystemExit(f"import-nes: {exc}")
         for note in report.notes():

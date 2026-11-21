@@ -62,6 +62,39 @@ def test_drop_tiles_is_legal_framing(tmp_path, store):
     assert d.manifest.provenance["derive"]["tiles_dropped"] == 1 + 2 + 3 * 2
 
 
+def test_shuffle_tiles_keeps_cells(tmp_path, store):
+    d = _derive(tmp_path, store, "--shuffle-tiles", "3", "--drop-tiles", "1:0,0")
+    row_major = [(x, y) for y in range(2) for x in range(3)]
+    keys = [d.keys(f.frame_id) for f in d.manifest.frames]
+    assert any(k != row_major for k in keys)                     # order changed
+    assert sorted(keys[0], key=lambda k: (k[1], k[0])) == row_major
+    assert set(keys[1]) == set(row_major) - {(0, 0)}              # dropped before shuffling
+    for f in (0, 2, 3):
+        np.testing.assert_array_equal(d.assemble(f), store.assemble(f))
+    assert d.manifest.tiling.tile_order == "shuffled" and d.manifest.provenance["derive"]["shuffle_tiles"] == 3
+    again = _derive(tmp_path, store, "--shuffle-tiles", "3", "--drop-tiles", "1:0,0", name="again")
+    assert [again.keys(f.frame_id) for f in again.manifest.frames] == keys   # seeded, reproducible
+    assert [f.sha256 for f in again.manifest.frames] == [f.sha256 for f in d.manifest.frames]
+
+
+def test_late_tiles(tmp_path, store):
+    d = _derive(tmp_path, store, "--drop-tiles", "2:row=1", "--late-tiles", "0:1,1@2", "--late-tiles", "1:0,0@2")
+    keys = [d.keys(f.frame_id) for f in d.manifest.frames]
+    assert (1, 1) not in keys[0] and (0, 0) not in keys[1]
+    assert keys[2] == [(0, 0), (1, 0), (2, 0), (1, 1), (0, 0)]        # own row 0, then the late maplets
+    late = [h for h, _ in d.records(2)][3:]
+    assert [(h.frame_id, h.flags) for h in late] == [(0, 2), (1, 2)]
+    a0 = d.assemble(0)
+    assert np.isnan(a0[:, 8:13, 8:16]).all()                        # missing from its own frame
+    np.testing.assert_array_equal(d.assemble(2)[:, :8], store.assemble(2)[:, :8])   # late maplets not assembled
+    assert all("tiles missing" in p for p in d.verify().problems)
+    assert d.manifest.frames[2].valid_cells == int((~np.isnan(d.assemble(2))).sum())
+    with pytest.raises(SystemExit):                                  # frame 3 is complete: no room
+        main(["derive", str(store.location), "--out", str(tmp_path / "full"), "--late-tiles", "0:0,0@3"])
+    with pytest.raises(SystemExit):
+        main(["derive", str(store.location), "--out", str(tmp_path / "back"), "--late-tiles", "2:0,0@1"])
+
+
 def test_bad_specs_are_rejected(tmp_path, store):
     for args in (["--frames", "3:9", "--nan", "2:tile=0,0"], ["--bands", "4"], ["--nan", "0:blob=1"],
                  ["--drop-tiles", "0:5,0"], ["--nan", "x:fraction=0.1"], ["--nan", "0:fraction=2"]):

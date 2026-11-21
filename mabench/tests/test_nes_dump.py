@@ -207,7 +207,8 @@ def test_nes_query_carries_geometry_window_and_dump_schema(stores):
     from mabench.nes_dump import nes_query
     INPUT = stores / "tiny-2b"
     q = nes_query(TileStore.open(INPUT), parse_workload("focal:min:circle:2"), "/tmp/d.bin")
-    assert "FOCAL_MIN(raster, DISC, 2, NODATA, nan, 10, 6, 4, 4)" in q
+    assert "FOCAL_MIN(raster, DISC, 2)" in q
+    assert "10 AS \"SOURCE\".RASTER_WIDTH, 6 AS \"SOURCE\".RASTER_HEIGHT, 4 AS \"SOURCE\".TILE_WIDTH, 4 AS \"SOURCE\".TILE_HEIGHT" in q
     assert "TUMBLING(ts, size 100 ms)" in q and "'Binary' AS \"SINK\".OUTPUT_FORMAT" in q
     assert "dump(srcId UINT32 NOT NULL, srcFrameId UINT32 NOT NULL, ts UINT64 NOT NULL, raster VARSIZED NOT NULL)" in q
     assert f"'{INPUT}' AS \"SOURCE\".FILE_PATH" in q
@@ -228,11 +229,11 @@ def test_nes_query_yaml_is_a_nes_cli_topology(stores):
     t = yaml.safe_load(nes_query(TileStore.open(stores / "tiny-2b"), parse_workload("focal:sum:square:1"), "/x/d.bin", yaml=True,
                                  store_path="/data/tiny-2b"))
     assert set(t) == {"query", "sinks", "logical", "physical", "workers"}
-    assert "FOCAL_SUM(raster, SQUARE, 1, NODATA, nan, 10, 6, 4, 4)" in t["query"]
+    assert "FOCAL_SUM(raster, SQUARE, 1)" in t["query"]
     assert t["sinks"][0]["config"] == {"file_path": "/x/d.bin", "output_format": "Binary"}
     assert [f["name"] for f in t["sinks"][0]["schema"]] == ["srcId", "srcFrameId", "ts", "raster"]
     assert t["physical"][0]["type"] == "RasterFile" and t["physical"][0]["parser_config"] == {"type": "NATIVE"}
-    assert t["physical"][0]["source_config"] == {"file_path": "/data/tiny-2b", "src_id": 1}
+    assert t["physical"][0]["source_config"] == {"file_path": "/data/tiny-2b", "src_id": 1, **{"raster_width": 10, "raster_height": 6, "tile_width": 4, "tile_height": 4}}
 
 
 def test_nes_query_void_sink(stores):
@@ -242,6 +243,33 @@ def test_nes_query_void_sink(stores):
     assert t["sinks"][0]["type"] == "Void" and t["sinks"][0]["config"] == {}
     with pytest.raises(ValueError):
         nes_query(TileStore.open(stores / "tiny-2b"), parse_workload("focal:sum:square:1"), None)
+
+
+def test_nes_query_paced_with_latency_sink(stores):
+    yaml = pytest.importorskip("yaml")
+    from mabench.nes_dump import nes_query
+    st, w = TileStore.open(stores / "tiny-2b"), parse_workload("focal:sum:square:1")
+    t = yaml.safe_load(nes_query(st, w, None, yaml=True, latency_path="/r/frame-latency.csv", frame_interval_us=250000,
+                                 pacing_log="/r/pacing.csv"))
+    assert t["sinks"][0]["type"] == "FrameLatency" and t["sinks"][0]["config"] == {"file_path": "/r/frame-latency.csv"}
+    assert [f["name"] for f in t["sinks"][0]["schema"]] == ["srcFrameId"]
+    assert t["query"].startswith("SELECT srcFrameId FROM (") and "FOCAL_SUM" in t["query"]
+    cfg = t["physical"][0]["source_config"]
+    assert cfg["frame_interval_us"] == 250000 and cfg["pacing_log"] == "/r/pacing.csv"
+    unpaced = yaml.safe_load(nes_query(st, w, None, yaml=True))
+    assert set(unpaced["physical"][0]["source_config"]) == {"file_path", "src_id", "raster_width", "raster_height", "tile_width", "tile_height"}
+    sql = nes_query(st, w, None, latency_path="/r/l.csv", frame_interval_us=1000)
+    assert "1000 AS \"SOURCE\".FRAME_INTERVAL_US" in sql and "TYPE FrameLatency" in sql and "PACING_LOG" not in sql
+    with pytest.raises(ValueError):
+        nes_query(st, w, "/x/d.bin", latency_path="/r/l.csv")
+
+
+def test_window_duration_fits_the_parser():
+    from mabench.nes_dump import duration
+    assert duration(432_000_000) == "5 DAY" and duration(8 * 432_000_000) == "40 DAY"
+    assert duration(300) == "300 ms" and duration(2000) == "2 SEC" and duration(7_200_000) == "2 HOUR"
+    with pytest.raises(ValueError):
+        duration(2 ** 31 + 1)
 
 
 def test_nes_query_frames_per_window(stores):
@@ -279,9 +307,18 @@ def test_nes_query_sliding_clause(stores):
                   slide_frames=2)
 
 
-def test_nes_query_bands_subquery(stores):
-    from mabench.nes_dump import nes_query
-    q = nes_query(TileStore.open(stores / "tiny-2b"), parse_workload(WORKLOAD), "/d.bin", bands=[2, 1])
-    assert "FROM (SELECT ts, srcId, srcFrameId, BANDS(raster, 1, 0) AS raster FROM tiles) WINDOW TUMBLING" in q
-    with pytest.raises(ValueError):
-        nes_query(TileStore.open(stores / "tiny-2b"), parse_workload(WORKLOAD), "/d.bin", bands=[3])
+def test_windows_containing_and_per_frame_expectation(env):
+    from mabench.nes_dump import window_ms, windows_containing
+    assert [windows_containing(t, 200, 100) for t in (0, 50, 100, 250)] == [1, 1, 2, 2]
+    assert [windows_containing(t, 100, 100) for t in (0, 100, 999)] == [1, 1, 1]
+    tmp, inp, ref, w, recs = env                       # tiny-2b: frames at 0 and 100 ms
+    assert window_ms(inp, 2, 1) == (200, 100)
+    # frame 0 (t = 0) is in one sliding window, frame 1 in two
+    second = [[s, f, ts, _patch(m, frame_id=fmt.MapletHeader.unpack_from(m).frame_id + 10)] for s, f, ts, m in recs
+              if f == 1]
+    _, rep = import_nes(_write_dump(tmp / "d.bin", recs + second), inp, w, str(tmp / "out"), frames_per_window=2,
+                        slide_frames=1)
+    assert not rep.multiplicity_problems, rep.multiplicity_problems
+    _, rep = import_nes(_write_dump(tmp / "d2.bin", recs), inp, w, str(tmp / "out2"), frames_per_window=2,
+                        slide_frames=1)
+    assert rep.multiplicity_problems == ["frame 1: 6 tile(s) emitted 1x, expected 2x"]

@@ -79,12 +79,14 @@ configuration (finished runs of a result set are skipped):
 
 | File | What |
 |---|---|
-| `scripts/correctness/cases.txt` | correctness cases K1–K10: `ID STORES OPS:SHAPES:RADII [KEY=V1,V2 ...]`, comma lists expand to all combinations; `SUMMATION=all`, `WINDOW_FRAMES`, `WINDOW_SLIDE`, `NES_INPUT` + `NES_BANDS`, `NES_THREADS`, `EXPECT=fail/error` |
+| `scripts/correctness/cases.txt` | correctness cases K1–K12: `ID STORES OPS:SHAPES:RADII [KEY=V1,V2 ...]`, comma lists expand to all combinations; `SUMMATION=all`, `WINDOW_FRAMES`, `WINDOW_SLIDE`, `NES_INPUT`, `NES_THREADS`, `EXPECT=fail/error` |
 | `scripts/perf/grids.txt` | performance grids G1–G7, same syntax; `WINDOW_FRAMES`, `PERF_THREADS`, `SYSTEMS`, `VARIANT` + `GT_JAVA_OPTS`, `RATE`, `NES_EVENT_TRACE` |
-| `scripts/data/stores.conf` | stores by name: `s2 FRAMES TILE`, `derive BASE ARGS` (mabench derive), `synth ARGS` |
+| `scripts/data/stores.txt` | stores by name: `s2 FRAMES TILE`, `derive BASE ARGS` (mabench derive), `synth ARGS` |
 
 `CASES` / `GRIDS` in `bench.env` (or arguments) select IDs, `FILTER="op=max radius=4"` narrows them, a line with
-`REQUIRES=<feature>` runs only when the feature is in `FEATURES` (e.g. `nes-pacing` for paced NES runs, not built yet).
+`REQUIRES=<feature>` runs only when the feature is in `FEATURES` (e.g. `nes-pacing`: paced NES runs, which need a NES build with the paced RasterFile source and the FrameLatency sink; G6 and K12).
+
+Paced runs (`RATE` frames/s): GeoTrellis releases frame i at t0 + i / rate; NES gets `FRAME_INTERVAL_US` = 1e6 / RATE on the RasterFile source and the FrameLatency sink instead of Void. The source writes `pacing.csv` (scheduled and actual release per frame), the sink `frame-latency.csv` (first and last output per source frame), both on the worker's steady clock; `mabench perf-table` turns them into window latency (as GeoTrellis reports it), frame latency, time to first output and the source's release lag.
 Data: `S2_*` in `bench.env` (tile, dates, crop window, frames per store); scenes that are NoData everywhere are skipped.
 
 Settings live in `bench.env`; machine-specific values (NES paths, memory) go into a git-ignored `bench.local.env`,
@@ -129,7 +131,8 @@ the script, output `$RESULTS/perf.csv`) turns all of them into one CSV row per r
 One measured run: the store is read into the page cache (`WARM_INPUT=1`, `scripts/lib/warm.sh`); NES: a worker is
 started (`scripts/nes/worker.sh start`, resource sampler `scripts/lib/sample.sh`), the same query runs untimed on the
 store's first frame (`NES_WARMUP=1`, store `<store>-warm1` made once by `mabench derive`), then the timed query, then
-the worker is stopped; GeoTrellis computes `GT_WARMUP` untimed frames in its own JVM and samples itself.
+the worker is stopped; GeoTrellis computes `GT_WARMUP` untimed frames in its own JVM. Memory is measured for NES only
+(bounded state is a requirement on the operator); GeoTrellis records no memory.
 `scripts/nes/run-query.sh` stays one query: with `NES_WORKER_DIR` it uses a running worker, otherwise it starts and
 stops one for that query.
 
@@ -138,20 +141,22 @@ stops one for that query.
 | `elapsed_s` | query Running → Stopped (worker timestamps) | first frame scheduled → last batch done |
 | `compute_s`, `buffer_s`, `gc_s` | – | focal operation, its neighbour-buffering part, GC inside the span |
 | `cpu_s`, `cells_per_cpu_s` | worker user + system CPU inside the span (samples, interpolated) | JVM process CPU inside the span |
-| `peak_rss_bytes`, `mean_rss_bytes` | sampled worker RSS inside the span | sampled JVM RSS inside the span |
-| `rss_hwm_bytes` | VmHWM over the worker's life (incl. start-up, warm-up) | VmHWM over the JVM's life (≈ heap with `-Xms = -Xmx`, pre-touch) |
-| `peak_heap_bytes` | – | sampled total used heap inside the span |
-| latency p50/95/99 | – (paced runs later) | per batch |
+| `peak_rss_bytes`, `mean_rss_bytes` | sampled worker RSS inside the span | – |
+| `rss_hwm_bytes` | VmHWM over the worker's life (incl. start-up, warm-up) | – |
+| latency p50/95/99 | paced runs: per window, per frame, first output | per batch |
 
-Resource samples (`resources.csv`, every `NES_SAMPLE_MS` / `--sample-ms`, default 100 ms) also feed the memory-over-time
-figure of `mabench report`. Older `perf.csv` files (`wall_s`, `peak_mem_bytes`) are still read.
+The NES worker's resource samples (`resources.csv`, every `NES_SAMPLE_MS`, default 100 ms) also feed the RSS-over-time
+figure of `mabench report`. Figures are written as PNG. Older `perf.csv` files (`wall_s`, `peak_mem_bytes`) are still
+read.
 
 ## Derived stores
 
 `mabench derive STORE --out OUT` makes a store from another one, same raster and tiling, frames renumbered 0..n-1:
 `--frames 0:4` (subset), `--bands 3,1` (select / reorder), `--scale 1e-4 --offset -0.1` (e.g. S2 reflectance from DN),
 `--nan F:fraction=P | F:block=X0,Y0,W,H | F:tile=X,Y` (injected NoData), `--drop-tiles F:X,Y | F:row=Y | F:col=X`
-(tiles left out of a frame, as a stream that lost them); `F` = derived frame id or `*`, `--seed` for the fraction mask.
+(tiles left out of a frame, as a stream that lost them); `F` = derived frame id or `*`, `--seed` for the fraction mask;
+`--shuffle-tiles SEED` (the maplets of every frame in a seeded random order, cells unchanged); `--late-tiles F:X,Y@G`
+(tile (X, Y) moved out of frame F to the end of frame G > F, flagged late: the source emits it with F's event time).
 `compare` leaves the cells of tiles missing from the input out of every stratum and reports how many there were.
 
 Sliding windows in correctness runs: `WINDOW_FRAMES=2 WINDOW_SLIDE=1 scripts/correctness/case.sh ...` (`nes-query

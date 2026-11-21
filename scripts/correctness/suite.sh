@@ -47,7 +47,7 @@ for i in "${!PLAN[@]}"; do
     "$STORES" "$store" > /dev/null
     path="$("$STORES" --path "$store")"
     w="${wl#focal:}"; w="${w//:/-}"
-    s="${NES_FOCAL_SUMMATION:-exact}"; [[ "$s" == exact ]] || w="$w-$s"
+    s="${NES_FOCAL_SUMMATION:-kahan}"; [[ "$s" == exact ]] || w="$w-$s"
     fpw="${WINDOW_FRAMES:-1}" slide="${WINDOW_SLIDE:-${WINDOW_FRAMES:-1}}"
     if [[ "$fpw" != 1 || "$slide" != "$fpw" ]]; then w="$w-w$fpw"; fi
     if [[ "$slide" != "$fpw" ]]; then w="${w}s$slide"; fi

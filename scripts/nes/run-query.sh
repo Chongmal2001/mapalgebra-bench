@@ -50,7 +50,7 @@ cat > "$OUT/run.json" <<EOF
   "pool_buffers": $NES_POOL_BUFFERS,
   "threads": $NES_THREADS,
   "max_inflight_buffers": $NES_MAX_INFLIGHT,
-  "focal_summation": "${NES_FOCAL_SUMMATION:-exact}",
+  "focal_summation": "${NES_FOCAL_SUMMATION:-kahan}",
   "worker_args": "$NES_WORKER_ARGS",
   "docker_memory": "$DOCKER_MEMORY",
   "docker_cpuset": "$DOCKER_CPUSET",

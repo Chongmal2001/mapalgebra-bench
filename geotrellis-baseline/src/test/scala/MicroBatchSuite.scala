@@ -59,8 +59,7 @@ class MicroBatchSuite extends AnyFunSuite {
     assert(num(s1, "checksum") == 0.0 && num(s2, "checksum") != 0.0)
     assert(num(s1, "tiles_out") == 2 * 2 * 12)       // frames x bands x tiles (4 x 3 grid)
     assert(num(s1, "gc_ms") >= 0 && num(s1, "compute_ms") > 0)
-    val res = Files.readAllLines(o1.resolve("resources.csv"), UTF_8)
-    assert(res.get(0) == "t_us,rss_kb,cpu_ticks,heap_used_bytes" && res.size >= 4)
+    assert(!Files.exists(o1.resolve("resources.csv")))      // memory is not measured
   }
 
   test("compute (BufferTiles + kernel per tile, 1 and 4 threads) equals CollectionFocalOperation bit for bit") {
@@ -91,7 +90,7 @@ class MicroBatchSuite extends AnyFunSuite {
   test("arrival rate paces the frames") {
     val (_, s) = run(MicroBatchRunner.Options(rate = 10))
     assert(num(s, "elapsed_ms") >= 100.0)
-    assert(num(s, "peak_heap_used_bytes") > 0 && num(s, "cpu_ms") > 0)
+    assert(num(s, "cpu_ms") > 0)
     assert(num(s, "span_end_us") - num(s, "span_start_us") >= 100000)
   }
 }

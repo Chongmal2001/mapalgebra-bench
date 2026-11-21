@@ -1,10 +1,11 @@
 """Expands a case / grid definition file into one run per line, for scripts/correctness/suite.sh and scripts/perf/grid.sh.
 
 Definition line:  ID  STORES  OPS:SHAPES:RADII  [KEY=V1,V2,...]...
-  STORES          store names of scripts/data/stores.conf, comma-separated
+  STORES          store names of scripts/data/stores.txt, comma-separated
   OPS:SHAPES:RADII  comma-separated lists, e.g. sum,mean:square,circle:1,4,16
   KEY=V1,V2       environment for the run; a comma list is one more axis (Cartesian product); quote values with spaces
-Special keys: SUMMATION (exact, running, kahan or all; non-exact only for square sum / mean), REQUIRES (features that
+Special keys: SUMMATION (exact, running, kahan or all; non-exact only for square sum / mean; default: NES' default,
+kahan for square sum / mean, exact otherwise), REQUIRES (features that
 must be listed in $FEATURES, else the line is skipped), EXPECT (pass | fail | error, correctness only).
 
 Output, one shell-quoted line per run:  ID STORE WORKLOAD STATUS KEY=VALUE...   (STATUS: run | skip:<feature>)
@@ -45,11 +46,11 @@ def expand(words):
     for store, op, shape, r in itertools.product(stores.split(","), ops, shapes, radii):
         for combo in itertools.product(*(v for _, v in axes)):
             env = dict(zip((k for k, _ in axes), combo))
-            s = env.pop("SUMMATION", "exact")
+            dense = shape == "square" and op in ("sum", "mean")
+            s = env.pop("SUMMATION", "kahan" if dense else "exact")
             if s != "exact" and not (shape == "square" and op in ("sum", "mean")):
                 continue
-            if s != "exact":
-                env["NES_FOCAL_SUMMATION"] = s
+            env["NES_FOCAL_SUMMATION"] = s
             yield rid, store, f"focal:{op}:{shape}:{r}", fixed.get("REQUIRES", ""), env
 
 

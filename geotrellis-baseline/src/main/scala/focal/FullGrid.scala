@@ -6,7 +6,9 @@ import de.tuberlin.dima.geotrellisbaseline.tilestore.Format.{MapletHeader, Recor
 
 /** Focal workload on a whole frame as one GeoTrellis tile per band: no tiling, no halos (correctness reference).
   *
-  * Missing input tiles stay NoData in the assembled frame. Output tiles are cut at the input positions.
+  * Missing input tiles stay NoData in the assembled frame. Output tiles are cut at every grid position, also where an
+  * input tile is missing: the output is defined for every cell (a missing tile's cells next to present tiles get values
+  * from them), as a streaming system that completes the frame at its deadline emits it.
   * Memory per frame: input bands + result bands (2x the frame) plus one band of GeoTrellis temporaries.
   *
   * Parallel (`stripeRows` > 0): each band is cut into stripes of `stripeRows` rows; a stripe is computed from its
@@ -28,7 +30,13 @@ object FullGrid {
       for (b <- 0 until nBands; row <- 0 until h.validRows)
         System.arraycopy(r.cells, b * h.planeCells + row * h.cols, bands(b), (h.tileY * h.rows + row) * width + h.tileX * h.cols, h.validCols)
     }
-    Frame(width, height, records.map(_.header), bands)
+    val proto = records.head.header
+    val present = records.map(r => (r.header.tileX, r.header.tileY) -> r.header).toMap
+    val tilesX = (width + proto.cols - 1) / proto.cols
+    val tilesY = (height + proto.rows - 1) / proto.rows
+    val headers = for (ty <- (0 until tilesY).toVector; tx <- 0 until tilesX)
+      yield present.getOrElse((tx, ty), proto.copy(tileX = tx, tileY = ty, frameId = 0, flags = 0))
+    Frame(width, height, headers, bands)
   }
 
   def compute(f: Frame, w: FocalWorkload, workers: Workers = Workers.Serial, stripeRows: Int = 0): Vector[Array[Double]] =

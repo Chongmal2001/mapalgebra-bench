@@ -20,23 +20,25 @@ import de.tuberlin.dima.geotrellisbaseline.tilestore.{FrameInfo, TileStore, Tile
   * main thread. Latency of a batch = end of its computation minus the scheduled arrival of its last frame, so reading
   * the frame and waiting behind earlier batches count.
   *
-  * Writes batches.csv (one row per batch), summary.json and resources.csv (`ResourceSampler`: RSS, CPU, used heap every
-  * `sampleMs`, plus one sample at the span boundaries and after every batch); with output `store` also a tile store of
-  * the results. Output `none` discards the result tiles (as a NES Void sink); `checksum` sums them inside the timed span.
+  * Writes batches.csv (one row per batch) and summary.json; with output `store` also a tile store of the results.
+  * Output `none` discards the result tiles (as a NES Void sink); `checksum` sums them inside the timed span.
   * Summary: `elapsed_ms` (first frame scheduled -> last batch done), `cpu_ms` (process CPU inside that span, all
-  * threads incl. GC and JIT), `peak_rss_bytes` / `mean_rss_bytes` / `peak_heap_used_bytes` (samples inside the span),
-  * `rss_hwm_bytes` (VmHWM over the JVM's life; with -Xms = -Xmx and AlwaysPreTouch about the whole heap).
+  * threads incl. GC and JIT). Memory is not measured.
   */
 object MicroBatchRunner {
 
   final case class Options(windowMs: Long = 0, rate: Double = 0, trigger: String = "frame", output: String = "checksum",
-                           warmup: Int = 0, sampleMs: Long = 100)
+                           warmup: Int = 0)
 
   final case class Batch(windowStartMs: Long, frames: Int, tiles: Int, lastArrivalNs: Long, startNs: Long, doneNs: Long,
                          computeNs: Long)
 
   // accumulated collection time of all collectors (ms)
   private def gcMs: Long = ManagementFactory.getGarbageCollectorMXBeans.asScala.map(b => math.max(0L, b.getCollectionTime)).sum
+
+  private val os = ManagementFactory.getOperatingSystemMXBean.asInstanceOf[com.sun.management.OperatingSystemMXBean]
+
+  private def nowUs: Long = { val i = java.time.Instant.now(); i.getEpochSecond * 1000000L + i.getNano / 1000 }
 
   def run(args: Main.Args, log: String => Unit = s => System.err.println(s)): Json = {
     val o = args.microbatch
@@ -57,7 +59,6 @@ object MicroBatchRunner {
     val writer = if (o.output == "store") Some(new TileStoreWriter(args.out, store)) else None
     Files.createDirectories(args.out)
     val workers = new Workers(args.threads)
-    val sampler = new ResourceSampler(args.out.resolve("resources.csv"), o.sampleMs)
     frames.take(o.warmup).foreach(f => FocalEngine.compute(FocalEngine.prepare(store.readFrame(f)), w, bounds, workers))
 
     var checksum = 0.0
@@ -78,14 +79,14 @@ object MicroBatchRunner {
           case None => tilesOut += r.bands.map(_.size).sum
         }
       }
-      sampler.mark()
       batches += Batch(windowOf(items.head._1) * windowMs, items.size, items.map(_._2.keys.size).sum, items.map(_._3).max,
                        start, System.nanoTime(), compute)
     }
 
-    System.gc()                // warm-up garbage out of the heap before the span, so used heap counts this run only
+    System.gc()                // warm-up garbage collected before the span, not inside it
     val gc0 = gcMs
-    val s0 = sampler.mark()
+    val span0Us = nowUs
+    val cpu0 = os.getProcessCpuTime
     val t0 = System.nanoTime()
     def arrival(i: Int): Long = if (o.rate > 0) t0 + (i / o.rate * 1e9).toLong else t0
     var pending = Vector.empty[(FrameInfo, FocalEngine.Prepared, Long)]
@@ -99,12 +100,10 @@ object MicroBatchRunner {
     }
     if (pending.nonEmpty) process(pending)
     val wallNs = System.nanoTime() - t0
-    val s1 = sampler.mark()
+    val cpuNs = os.getProcessCpuTime - cpu0
+    val span1Us = nowUs
     workers.close()
     val gcInWall = gcMs - gc0
-    val (peakRss, meanRss, peakHeap) = sampler.span(s0.tUs, s1.tUs)
-    val rssHwm = ResourceSampler.status("VmHWM") * 1024
-    sampler.close()
 
     val bs = batches.result()
     val ms = (ns: Long) => ns / 1e6
@@ -126,8 +125,8 @@ object MicroBatchRunner {
       "trigger" -> Json.fromString(o.trigger), "output" -> Json.fromString(o.output), "warmup_frames" -> Json.fromInt(o.warmup),
       "frames" -> Json.fromInt(frames.size), "batches" -> Json.fromInt(bs.size), "cells" -> Json.fromLong(cells),
       "elapsed_ms" -> Json.fromDoubleOrNull(ms(wallNs)),
-      "span_start_us" -> Json.fromLong(s0.tUs), "span_end_us" -> Json.fromLong(s1.tUs),
-      "cpu_ms" -> Json.fromDoubleOrNull(ms(s1.cpuNs - s0.cpuNs)),
+      "span_start_us" -> Json.fromLong(span0Us), "span_end_us" -> Json.fromLong(span1Us),
+      "cpu_ms" -> Json.fromDoubleOrNull(ms(cpuNs)),
       "threads" -> Json.fromInt(args.threads),
       "compute_ms" -> Json.fromDoubleOrNull(ms(bs.map(_.computeNs).sum)),
       "buffer_ms" -> Json.fromDoubleOrNull(ms(bufferNs)),
@@ -135,17 +134,12 @@ object MicroBatchRunner {
       "throughput_cells_per_s" -> Json.fromDoubleOrNull(cells / (wallNs / 1e9)),
       "latency_ms" -> Json.obj("p50" -> Json.fromDoubleOrNull(pct(0.5)), "p95" -> Json.fromDoubleOrNull(pct(0.95)),
                                "p99" -> Json.fromDoubleOrNull(pct(0.99)), "max" -> Json.fromDoubleOrNull(lat.last)),
-      "peak_heap_used_bytes" -> Json.fromLong(peakHeap),
-      "peak_rss_bytes" -> Json.fromLong(peakRss), "mean_rss_bytes" -> Json.fromLong(meanRss),
-      "rss_hwm_bytes" -> Json.fromLong(rssHwm),
-      "max_heap_bytes" -> Json.fromLong(Runtime.getRuntime.maxMemory),
       "checksum" -> Json.fromDoubleOrNull(checksum),
       "tiles_out" -> Json.fromLong(tilesOut))
     Files.write(args.out.resolve("summary.json"), summary.spaces2.getBytes("UTF-8"))
     writer.foreach(_.finish(Main.provenance(args)))
     log(f"${bs.size} batches, ${frames.size} frames, elapsed ${ms(wallNs)}%.1f ms (GC $gcInWall ms, " +
-        f"CPU ${ms(s1.cpuNs - s0.cpuNs)}%.1f ms), latency p50 ${pct(0.5)}%.1f ms, p99 ${pct(0.99)}%.1f ms, " +
-        f"peak used heap ${peakHeap >> 20} MiB, peak RSS ${peakRss >> 20} MiB")
+        f"CPU ${ms(cpuNs)}%.1f ms), latency p50 ${pct(0.5)}%.1f ms, p99 ${pct(0.99)}%.1f ms")
     summary
   }
 }

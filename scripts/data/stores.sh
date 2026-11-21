@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the named stores of scripts/data/stores.conf (and the stores they derive from); existing stores are kept.
+# Builds the named stores of scripts/data/stores.txt (and the stores they derive from); existing stores are kept.
 # S2 scenes are fetched first if none are there; scenes that are NoData everywhere are skipped, an S2 store takes the
 # first N of the rest in date order.
 #   scripts/data/stores.sh [NAME...]       default: main halo perf
@@ -7,7 +7,7 @@
 #   scripts/data/stores.sh --list          names and recipes
 set -euo pipefail
 source "$(dirname "$0")/../lib/common.sh"
-CONF="${STORES_CONF:-$BENCH_REPO/scripts/data/stores.conf}"
+CONF="${STORES_CONF:-$BENCH_REPO/scripts/data/stores.txt}"
 RAW="$DATA/raw/$S2_NAME"
 PERIOD_MS=432000000  # 5 days, the S2 revisit
 

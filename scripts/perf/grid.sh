@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Performance grids (scripts/perf/grids.txt, benchmark-design.md §4.4), one perf/run.sh per configuration. Stores are
-# built on demand (scripts/data/stores.sh). Systems per workload unless the grid line sets SYSTEMS:
-#   square sum/mean: nes nes-running nes-kahan geotrellis      otherwise: nes geotrellis
+# built on demand (scripts/data/stores.sh). Systems unless the grid line sets SYSTEMS: nes geotrellis (NES with its
+# default kernels; nes-exact and nes-running only where a line asks for them)
 # plus a NES passthrough (same store, frames per window, threads, variant; run once, then found finished).
 #   scripts/perf/grid.sh [ID...]                  default: $GRIDS (bench.env)
 #   FILTER="op=max radius=4" scripts/perf/grid.sh G1
@@ -15,10 +15,7 @@ IDS="${*:-$GRIDS}"
 STORES="$BENCH_REPO/scripts/data/stores.sh"
 export REPS
 
-systems() {
-  if [[ "$1" == square && ( "$2" == sum || "$2" == mean ) ]]; then echo "nes nes-running nes-kahan geotrellis"
-  else echo "nes geotrellis"; fi
-}
+systems() { echo "nes geotrellis"; }
 
 mapfile -t PLAN < <(python "$BENCH_REPO/scripts/lib/plan.py" "$FILE" "$IDS" "${FILTER:-}")
 [[ ${#PLAN[@]} -gt 0 ]] || { echo "no runs for '$IDS' ${FILTER:+(filter $FILTER)}" >&2; exit 2; }
@@ -34,7 +31,7 @@ for line in "${PLAN[@]}"; do
     IFS=: read -r _ op shape _ <<< "$wl"
     if [[ " ${SYSTEMS:-nes} " == *" nes"* && "${RATE:-0}" == 0 ]]; then
       echo "########## $id passthrough $store frames/window=${WINDOW_FRAMES:-1} threads=${PERF_THREADS:-1} ${VARIANT:-}"
-      SYSTEMS=nes-passthrough "$BENCH_REPO/scripts/perf/run.sh" "$path" focal:max:square:1 || exit 1
+      WINDOW_SLIDE= SYSTEMS=nes-passthrough "$BENCH_REPO/scripts/perf/run.sh" "$path" focal:max:square:1 || exit 1
     fi
     echo "########## $id $store $wl $*"
     SYSTEMS="${SYSTEMS:-$(systems "$shape" "$op")}" "$BENCH_REPO/scripts/perf/run.sh" "$path" "$wl"

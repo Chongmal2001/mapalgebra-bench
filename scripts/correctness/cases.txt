@@ -1,5 +1,5 @@
 # Correctness cases (benchmark-design.md §3), run by scripts/correctness/suite.sh: CASES="K1 K3" selects, the
-# lines of an ID together form the case. Syntax: scripts/lib/plan.py. Stores: scripts/data/stores.conf.
+# lines of an ID together form the case. Syntax: scripts/lib/plan.py. Stores: scripts/data/stores.txt.
 # id  stores       ops:shapes:radii                            settings (environment of scripts/correctness/case.sh)
 
 # K1 main matrix: every op, both shapes, radii; all summation modes on square sum / mean; 4 frames per tumbling window
@@ -9,9 +9,6 @@ K1    main         sum,mean,min,max:square,circle:4           SUMMATION=all WIND
 K2    halo         sum,mean,min,max:square,circle:20          SUMMATION=all
 # K3 sliding windows: 2 frames per window, advancing by 1 (each frame in 2 windows, every tile emitted twice)
 K3    sub4         sum,mean,min,max:square,circle:1,4         WINDOW_FRAMES=2 WINDOW_SLIDE=1
-# K4 band selection before focal: NES reads sub4 through BANDS(raster, ...), reference on the band-subset store
-K4    b2           mean,max:square,circle:1,4                 NES_INPUT=sub4 NES_BANDS=2
-K4    b31          mean,max:square,circle:1,4                 NES_INPUT=sub4 NES_BANDS=3,1
 # K5 fractional data: S2 reflectance (DN * 1e-4 - 0.1) and synthetic normal values, every summation mode
 K5    refl4,syn-normal  sum,mean:square:1,4,16                SUMMATION=all
 K5    refl4,syn-normal  sum,mean:circle:4                     SUMMATION=exact
@@ -20,9 +17,19 @@ K6    syn-adv      sum,mean:square:2,8                        SUMMATION=exact,ka
 K6    syn-adv      sum,mean:square:2,8                        SUMMATION=running EXPECT=fail
 # K7 NoData: sparse NoData, blocks larger than the window (all-NoData windows), blocks across seams, a NoData tile
 K7    nan4,syn-nodata  sum,mean,min,max:square,circle:1,4,16
-# K8 missing tiles (deadline path): single tile, seam pair, tile row, raster-edge column; 1 and 4 frames per window
+# K8 missing and late tiles (deadline path): single tile, seam pair, tile row, raster-edge column; 1 and 4 frames per
+# window. Late: frame 0's missing tile (3,3) arrives after frame 3's tiles (one worker thread, so frame 0's deadline has
+# passed) and must be dropped: the result equals the gaps4 reference
 K8    gaps4        sum,mean,min,max:square,circle:1,4         WINDOW_FRAMES=1,4
+K8    gaps4        mean,max:square,circle:1,4                 NES_INPUT=gaps4-late NES_THREADS=1 CASE_TAG=late
 # K9 thread stress: many small tiles, 16 worker threads (same reference as with 4)
 K9    halo4        mean,max:square,circle:1,4,20              NES_THREADS=16 CASE_TAG=t16
-# K10 documented limit: reach > 3 tiles (r = 50 at T = 16) must be rejected with an error, not computed wrongly
-K10   halo4        max:square:50                              EXPECT=error
+# K11 arbitrary tile order: NES reads the frames with their maplets shuffled; reference, import and compare use the
+# row-major store, so the results must match K1 / K2 (bit-identical; arrival order only changes when outputs leave)
+K11   sub4         sum,mean,min,max:square,circle:1,4         SUMMATION=all NES_INPUT=shuf4 CASE_TAG=shuf
+K11   sub4         mean,max:square:4                          NES_INPUT=shuf4 CASE_TAG=shuf WINDOW_FRAMES=4
+K11   halo4        mean,max:square,circle:1,20                NES_INPUT=halo4-shuf CASE_TAG=shuf
+# K12 paced source (one frame every 0.2 s): pacing cuts source buffers at frame boundaries; results must not change
+K12   sub4         mean,max:square,circle:4                   PACE_US=200000 CASE_TAG=paced REQUIRES=nes-pacing
+# K10 reach 4 (r = 50 at T = 16): 81 tile positions, presence mask beyond one 64-bit word
+K10   halo4        max:square:50

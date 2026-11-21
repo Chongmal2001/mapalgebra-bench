@@ -66,3 +66,18 @@ class FullGridSuite extends AnyFunSuite {
     }
   }
 }
+
+class FullGridGapSuite extends AnyFunSuite {
+  test("a tile missing from the input is still an output tile, with values next to present tiles") {
+    import de.tuberlin.dima.geotrellisbaseline.focal.{FullGrid, Workers}
+    val s = TileStore.open(Fixtures.path("ramp"))
+    val recs = s.readFrame(s.manifest.frames.head).filterNot(r => r.header.tileX == 1 && r.header.tileY == 0)
+    val f = FullGrid.assemble(recs, 50, 30)
+    assert(f.headers.size == 4 * 2 && f.headers.exists(h => h.tileX == 1 && h.tileY == 0))
+    val wl = FocalWorkload.parse("focal:max:square:1")
+    val out = FullGrid.split(f, FullGrid.compute(f, wl, Workers.Serial)).map(r => (r.header.tileX, r.header.tileY) -> r.cells).toMap
+    val gap = out((1, 0))
+    assert(!gap(5 * 16 + 0).isNaN, "left column of the gap sees tile (0, 0)")       // row 5, col 0
+    assert(gap(5 * 16 + 5).isNaN, "inside the gap, out of reach of present tiles")
+  }
+}

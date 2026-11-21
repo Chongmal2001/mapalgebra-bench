@@ -10,19 +10,19 @@ def _perf_csv(path):
     rows = []
     for fpw in (1, 4):
         for op in ("max", "mean"):
-            systems = ["nes", "geotrellis"] + (["nes-running", "nes-kahan"] if op == "mean" else [])
+            systems = ["nes", "geotrellis"] + (["nes-exact", "nes-running"] if op == "mean" else [])
             for r in (1, 2, 4):
                 for sys in systems:
                     for rep in (1, 2, 3):
                         wall = {"nes": 1.0 * r * r, "geotrellis": 2.0 * r, "nes-running": 0.5,
-                                "nes-kahan": 0.6}[sys] + 0.01 * rep
+                                "nes-exact": 0.6}[sys] + 0.01 * rep
                         rows.append({"system": sys, "threads": 1, "rep": rep, "store": "s", "frames": 4,
                                      "frames_per_window": fpw, "width": 10, "height": 10, "bands": 1, "tile_size": 4,
                                      "op": op, "shape": "square", "radius": r, "cells": 1_000_000, "elapsed_s": wall,
                                      "compute_s": wall * 0.8 if sys == "geotrellis" else "",
                                      "gc_s": 0.05 if sys == "geotrellis" else "",
                                      "throughput_cells_per_s": 1_000_000 / wall, "peak_rss_bytes": 2**30,
-                                     "cpu_s": wall, "peak_heap_bytes": 2**29 if sys == "geotrellis" else ""})
+                                     "cpu_s": wall})
         rows.append({"system": "nes-passthrough", "threads": 1, "rep": 1, "store": "s", "frames": 4,
                      "frames_per_window": fpw, "op": "max", "shape": "square", "radius": 1, "cells": 1_000_000,
                      "elapsed_s": 0.1, "throughput_cells_per_s": 1e7, "peak_rss_bytes": 2**29})
@@ -58,8 +58,9 @@ def test_report_writes_figures_and_tables(tmp_path):
     for f in ("throughput_s_square.png", "speedup_s_square.png", "window_s_square.png", "memory_s_square.png",
               "breakdown_s_max_square.png", "correctness_matrix.png", "report.md"):
         assert f in names, f
+    assert not any(n.endswith(".pdf") for n in names)
     md = (out / "report.md").read_text()
-    assert "2/3 PASS" in md and "| s | mean | square | 4 | 4 | nes-kahan | 1 | 3 |" in md
+    assert "2/3 PASS" in md and "| s | mean | square | 4 | 4 | nes-exact | 1 | 3 |" in md
 
 
 def test_legacy_perf_csv_and_timeline(tmp_path):
@@ -81,10 +82,10 @@ def test_legacy_perf_csv_and_timeline(tmp_path):
     rows = load_perf(tmp_path / "perf.csv")
     by = {r["system"]: r for r in rows}
     assert by["nes"]["elapsed_s"] == 2.0 and by["nes"]["rss_hwm_bytes"] == 2**30
-    assert by["geotrellis"]["peak_heap_bytes"] == 2**29 and by["geotrellis"]["rss_hwm_bytes"] is None
+    assert by["geotrellis"]["rss_hwm_bytes"] is None
     out = tmp_path / "report"
     assert main(["report", "--perf", str(tmp_path / "perf.csv"), "--results", str(tmp_path / "none"),
-                 "--out", str(out), "--format", "png"]) == 0
+                 "--out", str(out)]) == 0
     names = {p.name for p in out.iterdir()}
     assert "timeline_s_max_square.png" in names and "memory_s_square.png" in names
 

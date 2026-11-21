@@ -1,7 +1,8 @@
 """Derive a store from another one (``mabench derive``): frame subset, band selection, linear rescale, injected
-NoData, removed tiles. Same raster, tiling, transform and event times; frames are renumbered 0..n-1 in input order.
+NoData, removed tiles, late tiles, shuffled tile order. Same raster, tiling, transform and event times; frames are renumbered
+0..n-1 in input order.
 
-Order of the steps: frames -> bands -> scale/offset -> NoData -> removed tiles. Frame selectors in ``nan`` / ``drop``
+Order of the steps: frames -> bands -> scale/offset -> NoData -> removed / late tiles -> shuffled order. Frame selectors in ``nan`` / ``drop``
 refer to the derived frame ids (positions after ``frames``); ``*`` = every frame.
 
 NoData specs (all bands; padding stays NoData):
@@ -11,6 +12,11 @@ NoData specs (all bands; padding stays NoData):
 Removed tiles (the maplet is left out of the frame file, legal framing as for an output that lost tiles):
   ``F:X,Y``                 one tile
   ``F:row=Y`` / ``F:col=X`` a whole row / column of tiles
+Late tiles (moved out of their frame and appended to a later frame's file, flagged LATE with frame_id = their frame;
+the RasterFile source emits them with their own frame's event time, after the later frame):
+  ``F:X,Y@G``               tile (X, Y) of frame F, appended to frame G > F
+Shuffled tile order (``shuffle_tiles=SEED``): the maplets of every frame in a random order, seeded per frame; the
+cells are unchanged, the manifest records ``tile_order: "shuffled"``.
 """
 
 from __future__ import annotations
@@ -88,10 +94,19 @@ def parse_drop(spec: str) -> tuple[str, str, Any]:
     return f, "tile", tuple(_ints(rest, 2, f"--drop-tiles {spec!r}"))
 
 
+def parse_late(spec: str) -> tuple[int, tuple[int, int], int]:
+    f, rest = _frame_sel(spec)
+    tile, sep, g = rest.partition("@")
+    if f == "*" or not sep or not g.isdigit() or int(g) <= int(f):
+        raise ValueError(f"--late-tiles {spec!r}: expected F:X,Y@G with G > F")
+    return int(f), tuple(_ints(tile, 2, f"--late-tiles {spec!r}")), int(g)
+
+
 def derive(src: TileStore, out_location: str, frames: str | None = None, bands: list[int] | None = None,
            scale: float | None = None, offset: float | None = None, nan: list[str] = (), drop: list[str] = (),
            seed: int = 0, provenance: dict[str, Any] | None = None,
-           progress: Callable[[str], None] | None = None) -> Manifest:
+           progress: Callable[[str], None] | None = None, shuffle_tiles: int | None = None,
+           late: list[str] = ()) -> Manifest:
     m = src.manifest
     order = sorted(m.frames, key=lambda f: (f.event_time_ms, f.frame_id))
     picked = [order[i] for i in parse_frames(frames, len(order))]
@@ -102,6 +117,7 @@ def derive(src: TileStore, out_location: str, frames: str | None = None, bands: 
             raise ValueError(f"--bands {bands}: indices {bad or 'none'} outside 1..{nb}")
     sel = [b - 1 for b in bands] if bands else list(range(nb))
     nan_specs, drop_specs = [parse_nan(s) for s in nan], [parse_drop(s) for s in drop]
+    late_specs = [parse_late(s) for s in late]
     s, tx_n, ty_n = m.tiling.tile_size, m.tiling.tiles_x, m.tiling.tiles_y
     for f, kind, v in drop_specs:
         if kind == "tile" and not (0 <= v[0] < tx_n and 0 <= v[1] < ty_n) or \
@@ -110,6 +126,10 @@ def derive(src: TileStore, out_location: str, frames: str | None = None, bands: 
     for f, _, _ in nan_specs + drop_specs:
         if f != "*" and int(f) >= len(picked):
             raise ValueError(f"frame selector {f}: the derived store has frames 0..{len(picked) - 1}")
+    for f, (x, y), g in late_specs:
+        if g >= len(picked) or not (0 <= x < tx_n and 0 <= y < ty_n):
+            raise ValueError(f"--late-tiles {f}:{x},{y}@{g}: frame or tile outside the derived store")
+    pending: dict[int, list[tuple[fmt.MapletHeader, np.ndarray]]] = {}
 
     backend = backend_for(out_location)
     infos: list[FrameInfo] = []
@@ -145,7 +165,17 @@ def derive(src: TileStore, out_location: str, frames: str | None = None, bands: 
                     if xa < xb and ya < yb:
                         mask[ya:yb, xa:xb] = True
             c[:, mask] = np.nan
+            if g := next((g for f, k, g in late_specs if f == new_id and k == key), None):
+                pending.setdefault(g, []).append((replace(h, bands=len(sel), frame_id=new_id, flags=fmt.FLAG_LATE), c))
+                continue
             kept.append((replace(h, bands=len(sel)), c))
+        if shuffle_tiles is not None:
+            kept = [kept[i] for i in np.random.default_rng([shuffle_tiles, new_id]).permutation(len(kept))]
+        own = len(kept)
+        kept += pending.pop(new_id, [])
+        if len(kept) > tx_n * ty_n:
+            raise ValueError(f"--late-tiles: frame {new_id} would hold {len(kept)} maplets, more than the grid's "
+                             f"{tx_n * ty_n}; append late tiles to a frame with removed tiles")
         key = frame_key(new_id)
         digest, nbytes, valid = hashlib.sha256(), 0, 0
         with backend.open_write(key) as fh:
@@ -156,8 +186,9 @@ def derive(src: TileStore, out_location: str, frames: str | None = None, bands: 
                 nbytes += len(chunk)
 
             emit(replace(header, n_tiles=len(kept)).pack())
-            for h, c in kept:
-                valid += int(np.count_nonzero(~np.isnan(c[:, :h.valid_rows, :h.valid_cols])))
+            for i, (h, c) in enumerate(kept):
+                if i < own:
+                    valid += int(np.count_nonzero(~np.isnan(c[:, :h.valid_rows, :h.valid_cols])))
                 emit(fmt.encode_maplet(h, c))
         infos.append(FrameInfo(new_id, info.event_time_ms, key, len(kept), nbytes, digest.hexdigest(), valid,
                                {"derived_from_frame": info.frame_id, **info.source}))
@@ -166,8 +197,10 @@ def derive(src: TileStore, out_location: str, frames: str | None = None, bands: 
 
     in_sha = hashlib.sha256(src.backend.read_text("manifest.json").encode()).hexdigest()
     spec = {"frames": frames, "bands": bands, "scale": scale, "offset": offset, "nan": list(nan),
-            "drop_tiles": list(drop), "seed": seed, "tiles_dropped": dropped_total}
-    manifest = Manifest(raster=replace(m.raster, bands=len(sel)), tiling=m.tiling, frames=infos,
+            "drop_tiles": list(drop), "seed": seed, "tiles_dropped": dropped_total, "shuffle_tiles": shuffle_tiles,
+            "late_tiles": list(late)}
+    tiling = m.tiling if shuffle_tiles is None else replace(m.tiling, tile_order="shuffled")
+    manifest = Manifest(raster=replace(m.raster, bands=len(sel)), tiling=tiling, frames=infos,
                         provenance={"derived_from": str(src.location), "input_manifest_sha256": in_sha,
                                     "derive": spec, "input_provenance": m.provenance, **(provenance or {})})
     manifest.save(backend)

@@ -11,8 +11,7 @@ import de.tuberlin.dima.geotrellisbaseline.tilestore.TileStoreWriter
 
 /** {{{
   * sbt "run --mode fullgrid|tiled|microbatch --store DIR --workload (FILE.json | focal:<op>:<shape>:<r>) --out DIR [--no-verify]
-  *          [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N]
-  *          [--sample-ms N]"
+  *          [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N]"
   * }}}
   * fullgrid: correctness reference (FullGridRunner). tiled: GeoTrellis layer focal per frame (BatchRunner).
   * microbatch: performance baseline (MicroBatchRunner); the options from --window-ms on apply to it only.
@@ -32,7 +31,7 @@ object Main {
   def parseArgs(argv: Array[String]): Args = {
     def usage(msg: String): Nothing = {
       System.err.println(s"$msg\nusage: run --mode ${Modes.mkString("|")} --store DIR --workload (FILE.json | focal:<op>:<shape>:<r>) --out DIR " +
-        "[--no-verify] [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N] [--sample-ms N]")
+        "[--no-verify] [--threads N] [--stripe-rows N] [--window-ms N] [--rate FPS] [--trigger frame|window] [--output checksum|store|none] [--warmup N]")
       sys.exit(2)
     }
     var mode, store, workload, out: Option[String] = None
@@ -55,7 +54,6 @@ object Main {
       case "--trigger" if it.hasNext => mb = mb.copy(trigger = it.next())
       case "--output" if it.hasNext => mb = mb.copy(output = it.next())
       case "--warmup" if it.hasNext => mb = mb.copy(warmup = num(it.next(), _.toInt, "--warmup"))
-      case "--sample-ms" if it.hasNext => mb = mb.copy(sampleMs = num(it.next(), _.toLong, "--sample-ms"))
       case other => usage(s"unknown argument '$other'")
     }
     val md = mode.getOrElse(usage("--mode is required"))
