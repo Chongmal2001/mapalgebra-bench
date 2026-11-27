@@ -9,14 +9,21 @@ K1    main         sum,mean,min,max:square,circle:4           SUMMATION=all WIND
 K2    halo         sum,mean,min,max:square,circle:20          SUMMATION=all
 # K3 sliding windows: 2 frames per window, advancing by 1 (each frame in 2 windows, every tile emitted twice)
 K3    sub4         sum,mean,min,max:square,circle:1,4         WINDOW_FRAMES=2 WINDOW_SLIDE=1
+# Reference: GeoTrellis full grid, except for Sum / Mean on fractional data (K5, K6, K7 on syn-nodata), which use the
+# direct-summation oracle (REF_SYSTEM=oracle). GeoTrellis' Sum / Mean are running (cursor) kernels: on integer data every
+# partial sum is exact, so they evaluate the definition exactly; on fractional data their rounding error depends on the
+# cells already passed, not on V(c). Against the oracle, GeoTrellis exceeds the bound on refl4 (tol util 1.39 for
+# sum:square:1, 8.18 for sum:circle:4; 2026-11-21).
 # K5 fractional data: S2 reflectance (DN * 1e-4 - 0.1) and synthetic normal values, every summation mode
-K5    refl4,syn-normal  sum,mean:square:1,4,16                SUMMATION=all
-K5    refl4,syn-normal  sum,mean:circle:4                     SUMMATION=exact
+K5    refl4,syn-normal  sum,mean:square:1,4,16                SUMMATION=all REF_SYSTEM=oracle
+K5    refl4,syn-normal  sum,mean:circle:4                     SUMMATION=exact REF_SYSTEM=oracle
 # K6 adversarial dynamic range: exact and Kahan within tolerance; plain running sums are expected to exceed it
-K6    syn-adv      sum,mean:square:2,8                        SUMMATION=exact,kahan
-K6    syn-adv      sum,mean:square:2,8                        SUMMATION=running EXPECT=fail
+K6    syn-adv      sum,mean:square:2,8                        SUMMATION=exact,kahan REF_SYSTEM=oracle
+K6    syn-adv      sum,mean:square:2,8                        SUMMATION=running EXPECT=fail REF_SYSTEM=oracle
 # K7 NoData: sparse NoData, blocks larger than the window (all-NoData windows), blocks across seams, a NoData tile
-K7    nan4,syn-nodata  sum,mean,min,max:square,circle:1,4,16
+K7    nan4         sum,mean,min,max:square,circle:1,4,16
+K7    syn-nodata   min,max:square,circle:1,4,16
+K7    syn-nodata   sum,mean:square,circle:1,4,16              REF_SYSTEM=oracle
 # K8 missing and late tiles (deadline path): single tile, seam pair, tile row, raster-edge column; 1 and 4 frames per
 # window. Late: frame 0's missing tile (3,3) arrives after frame 3's tiles (one worker thread, so frame 0's deadline has
 # passed) and must be dropped: the result equals the gaps4 reference
@@ -33,3 +40,7 @@ K11   halo4        mean,max:square,circle:1,20                NES_INPUT=halo4-sh
 K12   sub4         mean,max:square,circle:4                   PACE_US=200000 CASE_TAG=paced REQUIRES=nes-pacing
 # K10 reach 4 (r = 50 at T = 16): 81 tile positions, presence mask beyond one 64-bit word
 K10   halo4        max:square:50
+# K13 nested focal: the same kernel applied twice, FOCAL(FOCAL(raster)), one windowed focal operator per level; the
+# inner operator's output (renumbered frames, FILLED tiles, Float64) is the outer one's input. 2 S2 frames; oracle
+# reference applied twice (GeoTrellis full grid composes no workloads), Sum/Mean bound 2 * tau * op^2(|v|)
+K13   sub2         sum,mean,min,max:square,circle:1           NEST=2 REF_SYSTEM=oracle

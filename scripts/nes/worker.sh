@@ -5,7 +5,8 @@
 #                                         the end, with clk_tck), then stops sampler and worker
 #   scripts/nes/worker.sh exec DIR CMD…   runs CMD where the worker runs (host or its container)
 #   scripts/nes/worker.sh alive|pid DIR
-# Worker settings (pool, threads, in-flight buffers, NES_FOCAL_SUMMATION, pinning) as in bench.env. NES_EVENT_TRACE=1:
+# Worker settings (pool, threads, in-flight buffers, NES_FOCAL_SUMMATION, pinning) as in bench.env; NES_CPUSET overrides
+# DOCKER_CPUSET for one worker (bench.local.env may set DOCKER_CPUSET, which would win over an inherited value). NES_EVENT_TRACE=1:
 # the worker writes a Chrome trace (trace_*.json in DIR) with every task's start and end per pipeline.
 set -euo pipefail
 source "$(dirname "$0")/../lib/common.sh"
@@ -40,7 +41,8 @@ case "$CMD" in
     if [[ "${NES_EVENT_TRACE:-0}" == 1 ]]; then WARGS+=" --enable_event_trace=true"; fi
     CONTAINER=; SAMPLER_PID=
     if [[ "$NES_NATIVE" == 1 ]]; then
-      PIN=(); if [[ -n "$DOCKER_CPUSET" ]]; then PIN=(taskset -c "$DOCKER_CPUSET"); fi
+      CS="${NES_CPUSET:-$DOCKER_CPUSET}"   # NES_CPUSET: per-run pinning from scripts/perf/run.sh (CPUSET_PER_THREAD)
+      PIN=(); if [[ -n "$CS" ]]; then PIN=(taskset -c "$CS"); fi
       # shellcheck disable=SC2086
       (cd "$DIR" && exec "${PIN[@]}" "$NES_WORKER_BIN" $WARGS > "$DIR/worker.log" 2>&1 < /dev/null) &
       WORKER_PID=$!

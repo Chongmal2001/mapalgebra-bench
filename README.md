@@ -79,7 +79,7 @@ configuration (finished runs of a result set are skipped):
 
 | File | What |
 |---|---|
-| `scripts/correctness/cases.txt` | correctness cases K1–K12: `ID STORES OPS:SHAPES:RADII [KEY=V1,V2 ...]`, comma lists expand to all combinations; `SUMMATION=all`, `WINDOW_FRAMES`, `WINDOW_SLIDE`, `NES_INPUT`, `NES_THREADS`, `EXPECT=fail/error` |
+| `scripts/correctness/cases.txt` | correctness cases K1–K13: `ID STORES OPS:SHAPES:RADII [KEY=V1,V2 ...]`, comma lists expand to all combinations; `SUMMATION=all`, `WINDOW_FRAMES`, `WINDOW_SLIDE`, `NEST`, `NES_INPUT`, `NES_THREADS`, `EXPECT=fail/error` |
 | `scripts/perf/grids.txt` | performance grids G1–G7, same syntax; `WINDOW_FRAMES`, `PERF_THREADS`, `SYSTEMS`, `VARIANT` + `GT_JAVA_OPTS`, `RATE`, `NES_EVENT_TRACE` |
 | `scripts/data/stores.txt` | stores by name: `s2 FRAMES TILE`, `derive BASE ARGS` (mabench derive), `synth ARGS` |
 
@@ -162,6 +162,11 @@ read.
 Sliding windows in correctness runs: `WINDOW_FRAMES=2 WINDOW_SLIDE=1 scripts/correctness/case.sh ...` (`nes-query
 --slide-frames`); `import-nes --windows-per-frame N` then requires every output tile exactly N times (tumbling: 1),
 and `compare` fails on any multiplicity problem.
+
+Nested focal operators (K13): `NEST=2 REF_SYSTEM=oracle scripts/correctness/case.sh ...` runs FOCAL(FOCAL(raster)),
+one windowed focal operator per level (`--nest N` on `nes-query`, `reference`, `import-nes`, `compare`, suffix `-nN`
+on run and reference). The oracle reference applies the operation N times; Min/Max must match bit for bit, Sum/Mean
+within N * tau * op^N(|v|). GeoTrellis full grid composes no workloads, so NEST needs the oracle reference.
 
 ## Sources of truth
 

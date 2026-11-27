@@ -17,6 +17,8 @@
 # sliding window advancing by S frames (suffix -wNsS; every output tile must then appear once per window containing
 # its frame, N/S times except for frames in the first window). The reference is shared. PACE_US=N: paced NES source
 # (one frame every N µs, buffers cut at frame boundaries; needs a NES build with pacing); results must not change.
+# NEST=N (N > 1): the focal operation applied N times, FOCAL(FOCAL(raster)) for N = 2 (suffix -nN on run and reference;
+# oracle reference only, GeoTrellis full grid composes no workloads).
 set -euo pipefail
 
 [[ $# -eq 2 ]] || { sed -n '2,20p' "$0"; exit 2; }
@@ -33,10 +35,14 @@ SLIDE="${WINDOW_SLIDE:-$FPW}"
 (( SLIDE >= 1 && FPW % SLIDE == 0 )) || { echo "error: WINDOW_SLIDE must divide WINDOW_FRAMES" >&2; exit 2; }
 if [[ "$FPW" != 1 || "$SLIDE" != "$FPW" ]]; then RUNW="$RUNW-w$FPW"; fi
 if [[ "$SLIDE" != "$FPW" ]]; then RUNW="${RUNW}s$SLIDE"; fi
+NEST="${NEST:-1}"
+NEST_ARGS=()
+if [[ "$NEST" != 1 ]]; then RUNW="$RUNW-n$NEST"; W="$W-n$NEST"; NEST_ARGS=(--nest "$NEST"); fi
 if [[ -n "${CASE_TAG:-}" ]]; then RUNW="$RUNW-$CASE_TAG"; fi
 CASE="${CASE_ID:-adhoc}"
 NES_STORE="$(realpath "${NES_INPUT:-$STORE}")"
 REF_SYSTEM="${REF_SYSTEM:-geotrellis}"
+if [[ "$NEST" != 1 && "$REF_SYSTEM" != oracle ]]; then echo "error: NEST needs REF_SYSTEM=oracle" >&2; exit 2; fi
 REF="$DATA/refs/$REF_SYSTEM/$NAME/$W"
 RUN="$RESULTS/runs/$CASE/$NAME/$RUNW"
 NES_OUT="$DATA/out/nes/$CASE/$NAME/$RUNW"
@@ -51,7 +57,7 @@ elif [[ "$REF_SYSTEM" == geotrellis ]]; then
   (cd "$REPO/geotrellis-baseline" && sbt -batch "run --mode fullgrid --store $STORE --workload $WORKLOAD --out $REF --threads $GT_REF_THREADS")
 else
   echo "== oracle reference -> $REF"
-  mabench reference "$STORE" --workload "$WORKLOAD" --out "$REF"
+  mabench reference "$STORE" --workload "$WORKLOAD" "${NEST_ARGS[@]}" --out "$REF"
 fi
 if [[ "${NES:-1}" == 0 ]]; then exit 0; fi
 
@@ -59,16 +65,18 @@ if [[ -e "$RUN/dump.bin" && -e "$RUN/status.json" ]] && grep -q '"Stopped"' "$RU
   echo "== NES dump exists, reusing: $RUN/dump.bin"
 else
   echo "== NES ($WORKLOAD) -> $RUN"
-  mabench nes-query "$NES_STORE" --workload "$WORKLOAD" --dump "$RUN/dump.bin" --yaml --frames-per-window "$FPW" \
+  mabench nes-query "$NES_STORE" --workload "$WORKLOAD" "${NEST_ARGS[@]}" --dump "$RUN/dump.bin" --yaml --frames-per-window "$FPW" \
           --slide-frames "$SLIDE" ${NES_STORE_PATH:+--store-path "$NES_STORE_PATH"} \
           ${PACE_US:+--frame-interval-us "$PACE_US" --pacing-log "$RUN/pacing.csv"} > "$RUN/topology.yaml"
   "$REPO/scripts/nes/run-query.sh" "$RUN/topology.yaml" "$RUN"
 fi
 
 echo "== import -> $NES_OUT"
-mabench import-nes "$RUN/dump.bin" --input "$STORE" --workload "$WORKLOAD" --out "$NES_OUT" --force \
+mabench import-nes "$RUN/dump.bin" --input "$STORE" --workload "$WORKLOAD" "${NEST_ARGS[@]}" --out "$NES_OUT" --force \
   --frames-per-window "$FPW" --slide-frames "$SLIDE"
 if [[ "${KEEP_DUMP:-1}" == 0 ]]; then rm -f "$RUN/dump.bin"; fi
 echo "== compare"
-mabench compare "$NES_OUT" --reference "$REF" --input "$STORE" --json "$RES/$RUNW.json" --heatmap "$RES/$RUNW.png"
+rc=0   # a FAIL exits non-zero; the output is deleted either way
+mabench compare "$NES_OUT" --reference "$REF" --input "$STORE" "${NEST_ARGS[@]}" --json "$RES/$RUNW.json" --heatmap "$RES/$RUNW.png" || rc=$?
 if [[ "${KEEP_OUTPUT:-1}" == 0 ]]; then rm -rf "$NES_OUT"; fi
+exit $rc

@@ -1,10 +1,3 @@
-"""Where tile stores live.
-
-Local disk is the default and the only backend the benchmark runs read from.
-Object storage (S3, GCS, Azure, via fsspec) exists for staging very large
-datasets; copy a store to local disk before a timed run.
-"""
-
 from __future__ import annotations
 
 import mmap
@@ -17,18 +10,16 @@ from typing import BinaryIO, Iterator
 
 
 class StorageBackend(ABC):
-    """Key-value view of a store location. Keys are '/'-separated relative paths."""
-
     location: str
 
     @abstractmethod
     @contextmanager
     def open_write(self, key: str) -> Iterator[BinaryIO]:
-        """Write a new object; it becomes visible only if the block exits cleanly."""
+        ...
 
     @abstractmethod
     def read_buffer(self, key: str):
-        """Return a buffer (bytes or mmap) with the object's full content."""
+        ...
 
     @abstractmethod
     def exists(self, key: str) -> bool: ...
@@ -57,7 +48,7 @@ class LocalBackend(StorageBackend):
         try:
             with os.fdopen(fd, "wb") as fh:
                 yield fh
-            os.replace(tmp, path)  # atomic: a crashed run never leaves a half-written frame
+            os.replace(tmp, path)  # atomic: no half-written frame
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
@@ -74,8 +65,6 @@ class LocalBackend(StorageBackend):
 
 
 class FsspecBackend(StorageBackend):
-    """Object storage through fsspec (``pip install mabench[blob]`` plus s3fs/gcsfs/adlfs)."""
-
     def __init__(self, url: str):
         try:
             import fsspec
@@ -89,7 +78,6 @@ class FsspecBackend(StorageBackend):
 
     @contextmanager
     def open_write(self, key: str):
-        # Object stores commit on close, so an aborted write leaves no object behind.
         path = self._path(key)
         parent = path.rsplit("/", 1)[0]
         self.fs.makedirs(parent, exist_ok=True)
@@ -105,7 +93,6 @@ class FsspecBackend(StorageBackend):
 
 
 def backend_for(location: str | os.PathLike) -> StorageBackend:
-    """Local path or ``file://`` URL -> LocalBackend; any other URL scheme -> FsspecBackend."""
     loc = str(location)
     if "://" not in loc:
         return LocalBackend(loc)

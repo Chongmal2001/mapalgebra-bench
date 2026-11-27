@@ -10,8 +10,8 @@ def test_perf_table_reads_nes_and_geotrellis_runs(tmp_path):
     store = tmp_path / "s"
     assert main(["synth", "--out", str(store), "--width", "10", "--height", "6", "--bands", "2", "--frames", "3",
                  "--generator", "ramp", "--tile-size", "4"]) == 0
-    cells = 3 * 10 * 6 * 2                       # frames x width x height x bands (real cells, no tile padding)
-    padded = 3 * 6 * 2 * 16                      # frames x tiles (3 x 2) x bands x tile_size^2
+    cells = 3 * 10 * 6 * 2
+    padded = 3 * 6 * 2 * 16
     nes, gt = tmp_path / "perf" / "nes-t1" / "rep1", tmp_path / "perf" / "geotrellis-t1" / "rep1"
     for d, system in ((nes, "nes"), (gt, "geotrellis")):
         d.mkdir(parents=True)
@@ -23,7 +23,6 @@ def test_perf_table_reads_nes_and_geotrellis_runs(tmp_path):
          "stopped": {"since_epoch": 3_000_000}}]))
     (nes / "worker_vmhwm").write_text("VmHWM:\t    2048 kB\n")
     (nes / "worker_stat").write_text("1 (nes) S 0 0 0\nclk_tck 100\n")
-    # samples every 0.5 s; the span 1.0 s .. 3.0 s holds the samples at 1.0, 1.5, ..., 3.0 s
     (nes / "resources.csv").write_text("t_us,rss_kb,cpu_ticks\n" + "".join(
         f"{t * 500_000},{1000 + 100 * t},{50 * t}\n" for t in range(0, 8)) + "7,")
     (gt / "summary.json").write_text(json.dumps({"elapsed_ms": 500.0, "compute_ms": 400.0, "buffer_ms": 40.0,
@@ -36,22 +35,22 @@ def test_perf_table_reads_nes_and_geotrellis_runs(tmp_path):
     assert int(rows["nes"]["cells_padded"]) == padded
     assert float(rows["nes"]["elapsed_s"]) == 2.0 and float(rows["nes"]["throughput_cells_per_s"]) == cells / 2
     assert int(rows["nes"]["rss_hwm_bytes"]) == 2048 * 1024
-    assert int(rows["nes"]["peak_rss_bytes"]) == (1000 + 100 * 6) * 1024          # last sample inside the span
-    assert int(rows["nes"]["mean_rss_bytes"]) == (1000 + 100 * 4) * 1024          # samples 2..6
-    assert float(rows["nes"]["cpu_s"]) == 2.0                                      # 200 ticks at 100 per second
+    assert int(rows["nes"]["peak_rss_bytes"]) == (1000 + 100 * 6) * 1024
+    assert int(rows["nes"]["mean_rss_bytes"]) == (1000 + 100 * 4) * 1024
+    assert float(rows["nes"]["cpu_s"]) == 2.0
     assert float(rows["nes"]["cells_per_cpu_s"]) == cells / 2
     assert float(rows["geotrellis"]["throughput_cells_per_s"]) == cells / 0.5
     assert (rows["geotrellis"]["op"], rows["geotrellis"]["shape"], rows["geotrellis"]["radius"]) == ("max", "circle", "2")
     assert float(rows["geotrellis"]["compute_s"]) == 0.4 and float(rows["geotrellis"]["gc_s"]) == 0.02
     assert float(rows["geotrellis"]["buffer_s"]) == 0.04 and float(rows["geotrellis"]["cpu_s"]) == 1.0
-    assert rows["geotrellis"]["peak_rss_bytes"] == "" and rows["geotrellis"]["rss_hwm_bytes"] == ""   # not measured
+    assert rows["geotrellis"]["peak_rss_bytes"] == "" and rows["geotrellis"]["rss_hwm_bytes"] == ""
     assert rows["nes"]["compute_s"] == "" and rows["nes"]["gc_s"] == ""
 
 
 def test_span_resources_short_span_and_legacy_summary(tmp_path):
     from mabench.perf import _geotrellis, span_resources
     samples = [(0, 100, 0), (100_000, 200, 10), (200_000, 300, 20)]
-    r = span_resources(samples, 120_000, 150_000, 100)      # no sample inside: nearest after the start
+    r = span_resources(samples, 120_000, 150_000, 100)
     assert r["peak_rss_bytes"] == 300 * 1024 and abs(r["cpu_s"] - 0.03) < 1e-12
     (tmp_path / "summary.json").write_text(json.dumps({"wall_ms": 2000.0, "cells": 1}))
     g = _geotrellis(tmp_path)
@@ -72,7 +71,7 @@ def test_event_trace_variant_and_rate(tmp_path):
                                         "name": "Task", "ph": "E", "pid": 1, "tid": 2, "ts": ts})
     (run / "trace_x.json").write_text('{\n  "traceEvents": [\n'
                                       + ",\n".join(["    " + ev(500, 400, 1), "    " + ev(2000, 1000, 2),
-                                                    "    " + ev(8000, 3000, 3), "    " + ev(9500, 7, 3)]))   # unterminated
+                                                    "    " + ev(8000, 3000, 3), "    " + ev(9500, 7, 3)]))
     (run / "worker.log").write_text("x Event queue full, 1 events dropped so far\ny Event queue full, 100 events dropped\n")
     gt = tmp_path / "perf" / "gt-noavx" / "rep1"
     gt.mkdir(parents=True)
@@ -115,12 +114,9 @@ def test_paced_latency_nes_and_geotrellis(tmp_path):
     assert main(["perf-table", str(tmp_path / "perf"), "--out", str(tmp_path / "perf.csv")]) == 0
     rows = {r["system"]: r for r in csv.DictReader(open(tmp_path / "perf.csv"))}
     nes, g = rows["nes"], rows["geotrellis"]
-    # per frame: last - due = 10, 11, 12, 13 ms; first - due = 2 ms; lag 5 ms on the last frame
     assert float(nes["frame_latency_p50_ms"]) == 11 and float(nes["frame_latency_p99_ms"]) == 13
     assert float(nes["ttfo_p95_ms"]) == 2 and float(nes["release_lag_max_ms"]) == 5
-    # windows of 2 frames: max last - due of the window's last frame = 11, 13 ms
     assert float(nes["latency_p50_ms"]) == 11 and float(nes["latency_p99_ms"]) == 13
-    # GeoTrellis: frames at 0 / 100 ms done at 130 ms, frames at 200 / 300 ms done at 320 ms
     assert float(g["frame_latency_p99_ms"]) == 130 and float(g["frame_latency_p50_ms"]) == 30
     assert float(g["ttfo_p50_ms"]) == 30 and float(g["latency_p50_ms"]) == 20
     (run / "frame-latency.csv").write_text("src_frame_id,first_ns,last_ns,tuples\n")

@@ -1,12 +1,3 @@
-"""Cut a raster source into fixed-size tiles and write a tile store (record version 4).
-
-Each frame file is one frame header (raster-level facts, event time, NoData) followed by one self-locating
-maplet per tile, row-major; maplet ``frame_id`` is 0 (unassigned) because the NES source numbers frames.
-
-Reads one strip of tile rows at a time, so memory stays at roughly
-``width * tile_size * bands * 8`` bytes regardless of raster size.
-"""
-
 from __future__ import annotations
 
 import hashlib

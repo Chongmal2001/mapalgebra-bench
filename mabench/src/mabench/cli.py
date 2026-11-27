@@ -31,6 +31,19 @@ from .tiler import tile_source
 from .workloads import load_workload, parse_workload
 
 
+def _with_nest(w, nest: int | None):
+    if nest is None:
+        return w
+    if getattr(w, "family", None) != "focal":
+        raise SystemExit("--nest applies to focal workloads only")
+    from dataclasses import replace
+    return replace(w, nest=nest)
+
+
+def _workload(spec: str, nest: int | None = None):
+    return _with_nest(load_workload(spec) if spec.endswith(".json") else parse_workload(spec), nest)
+
+
 def _provenance(argv: list[str]) -> dict[str, Any]:
     from datetime import datetime, timezone
     return {"tool": "mabench", "version": __version__, "argv": argv,
@@ -54,12 +67,6 @@ def _params(pairs: list[str]) -> dict[str, Any]:
 
 
 def _select_variable(path: str, variable: str) -> str:
-    """GDAL path of one variable inside a container file (NetCDF, HDF5, HDF4, Zarr, ...).
-
-    Containers expose their variables as subdatasets, e.g. ``NETCDF:"f.nc":CMI`` or
-    ``HDF5:"f.h5"://group/CMI``. The match is on the name after the last ':' or '/', so the
-    same --variable works for every container format GDAL can read.
-    """
     import rasterio
 
     with rasterio.open(path) as src:
@@ -75,8 +82,6 @@ def _select_variable(path: str, variable: str) -> str:
 
 
 def _expand_inputs(inputs: list[str], variable: str | None) -> list[str]:
-    """Expand glob patterns ourselves (IDE run configurations do not go through a shell), sort the
-    matches so frames follow file-name (= time) order, and optionally select one variable per file."""
     files: list[str] = []
     for arg in inputs:
         if any(c in arg for c in "*?[") and ":" not in arg.split("/")[0]:
@@ -154,16 +159,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("store")
 
     p = sub.add_parser("workload", help="write a workload.json")
+    p.add_argument("--nest", type=int, metavar="N",
+                   help="apply the focal operation N times, each on the previous result (case K13); default 1")
     p.add_argument("spec", help="e.g. focal:mean:square:3")
     p.add_argument("-o", "--out", required=True)
 
     p = sub.add_parser("reference", help="compute the oracle result of a workload")
+    p.add_argument("--nest", type=int, metavar="N",
+                   help="apply the focal operation N times, each on the previous result (case K13); default 1")
     p.add_argument("store")
     p.add_argument("--workload", required=True, help="workload.json or short spec (focal:mean:square:3)")
     p.add_argument("--out", required=True)
     p.add_argument("--force", action="store_true")
 
     p = sub.add_parser("compare", help="compare a candidate output store with a reference output store")
+    p.add_argument("--nest", type=int, metavar="N",
+                   help="apply the focal operation N times, each on the previous result (case K13); default 1")
     p.add_argument("candidate", help="output store of the system under test (NES, GeoTrellis)")
     p.add_argument("--reference", required=True, help="oracle output store (mabench reference)")
     p.add_argument("--input", required=True, help="input store both outputs were computed from")
@@ -176,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                         "env MABENCH_JOBS)")
 
     p = sub.add_parser("nes-query", help="print the NES statements that run a workload on a store into a Binary dump")
+    p.add_argument("--nest", type=int, metavar="N",
+                   help="apply the focal operation N times, each on the previous result (case K13); default 1")
     p.add_argument("store")
     p.add_argument("--workload", required=True)
     g = p.add_mutually_exclusive_group(required=True)
@@ -199,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="sliding window: advance in event-time steps (divides --frames-per-window; default: tumbling)")
 
     p = sub.add_parser("import-nes", help="turn a NES Binary dump into a candidate output store")
+    p.add_argument("--nest", type=int, metavar="N",
+                   help="apply the focal operation N times, each on the previous result (case K13); default 1")
     p.add_argument("dump", help="file written by the NES File sink with output format Binary, sink schema "
                                 "(srcId UINT32, srcFrameId UINT32, ts UINT64, raster VARSIZED), all NOT NULL")
     p.add_argument("--input", required=True, help="input store the NES query read (RasterFile source)")
@@ -275,13 +290,13 @@ def main(argv: list[str] | None = None) -> int:
         print("OK" if report.ok else f"{len(report.problems)} problem(s)")
         return 0 if report.ok else 1
     elif args.cmd == "workload":
-        w = parse_workload(args.spec)
+        w = _workload(args.spec, args.nest)
         w.save(args.out)
         say(f"wrote {w.name} to {args.out}")
     elif args.cmd == "reference":
         _refuse_existing(args.out, args.force)
         store = TileStore.open(args.store)
-        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        w = _workload(args.workload, args.nest)
         for note in w.validate(store.manifest):
             say(f"{note.level}: {note.message}")
         w.reference(store, args.out)
@@ -291,9 +306,9 @@ def main(argv: list[str] | None = None) -> int:
         from .workloads import workload_from_dict
         inp, ref, cand = TileStore.open(args.input), TileStore.open(args.reference), TileStore.open(args.candidate)
         if args.workload:
-            w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+            w = _workload(args.workload, args.nest)
         elif "workload" in ref.manifest.provenance:
-            w = workload_from_dict(ref.manifest.provenance["workload"])
+            w = _with_nest(workload_from_dict(ref.manifest.provenance["workload"]), args.nest)
         else:
             raise SystemExit("reference has no workload in its provenance; pass --workload")
         report = w.compare(inp, ref, cand, tau=args.tau, heatmap=args.heatmap,
@@ -305,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.passed else 1
     elif args.cmd == "nes-query":
         from .nes_dump import nes_query
-        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        w = _workload(args.workload, args.nest)
         if args.void and not args.yaml:
             raise SystemExit("nes-query: --void needs --yaml")
         print(nes_query(TileStore.open(args.store), w, args.dump, args.source, args.src_id, yaml=args.yaml,
@@ -315,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "import-nes":
         from .nes_dump import import_nes
         _refuse_existing(args.out, args.force)
-        w = load_workload(args.workload) if args.workload.endswith(".json") else parse_workload(args.workload)
+        w = _workload(args.workload, args.nest)
         try:
             m, report = import_nes(args.dump, TileStore.open(args.input), w, args.out, src_id=args.src_id,
                                    provenance=_provenance(argv), progress=say,

@@ -1,24 +1,3 @@
-"""Derive a store from another one (``mabench derive``): frame subset, band selection, linear rescale, injected
-NoData, removed tiles, late tiles, shuffled tile order. Same raster, tiling, transform and event times; frames are renumbered
-0..n-1 in input order.
-
-Order of the steps: frames -> bands -> scale/offset -> NoData -> removed / late tiles -> shuffled order. Frame selectors in ``nan`` / ``drop``
-refer to the derived frame ids (positions after ``frames``); ``*`` = every frame.
-
-NoData specs (all bands; padding stays NoData):
-  ``F:fraction=P``          each cell independently with probability P (seeded per frame and tile)
-  ``F:block=X0,Y0,W,H``     raster cells x in [X0, X0+W), y in [Y0, Y0+H)
-  ``F:tile=X,Y``            the whole tile (X, Y)
-Removed tiles (the maplet is left out of the frame file, legal framing as for an output that lost tiles):
-  ``F:X,Y``                 one tile
-  ``F:row=Y`` / ``F:col=X`` a whole row / column of tiles
-Late tiles (moved out of their frame and appended to a later frame's file, flagged LATE with frame_id = their frame;
-the RasterFile source emits them with their own frame's event time, after the later frame):
-  ``F:X,Y@G``               tile (X, Y) of frame F, appended to frame G > F
-Shuffled tile order (``shuffle_tiles=SEED``): the maplets of every frame in a random order, seeded per frame; the
-cells are unchanged, the manifest records ``tile_order: "shuffled"``.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -35,7 +14,6 @@ from .tiler import frame_key
 
 
 def parse_frames(spec: str | None, n: int) -> list[int]:
-    """Positions in the input: ``a:b`` (Python slice, either end optional) or ``0,2,5``."""
     if not spec:
         return list(range(n))
     if ":" in spec:

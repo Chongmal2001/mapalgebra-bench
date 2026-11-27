@@ -1,30 +1,3 @@
-"""Throughput runs -> one CSV row per run (``mabench perf-table``).
-
-scripts/perf/run.sh leaves one directory per run with ``meta.json`` (system, store, workload, threads, rep, build)
-next to the system's own output:
-
-- NES (systems nes = default kernels, nes-exact, nes-running, and nes-passthrough: same source and Void sink, no
-  focal window):
-  ``status.json`` (nes-cli status; the timed span is running -> stopped, so worker start, warm-up query and query
-  compilation are outside it), ``resources.csv`` (worker RSS and CPU ticks every ~100 ms, scripts/lib/sample.sh),
-  ``worker_vmhwm`` (peak RSS over the worker's life) and ``worker_stat`` (clock ticks per second).
-- GeoTrellis: ``summary.json`` of the micro-batch runner (elapsed time from the first frame's arrival to the last
-  batch's end, after warm-up; ``compute_s`` = focal operation alone, ``buffer_s`` = its neighbour-buffering part,
-  ``gc_s`` = GC time inside the span; process CPU inside the span; per-batch latency). GeoTrellis memory is not
-  measured: the requirement on bounded state concerns NES only.
-
-Metrics: ``elapsed_s`` (formerly ``wall_s``: elapsed wall-clock time of the measured span), ``cpu_s`` (user + system
-CPU of the process inside the span, all threads), ``peak_rss_bytes`` / ``mean_rss_bytes`` (NES: sampled worker RSS
-inside the span), ``rss_hwm_bytes`` (NES: VmHWM over the worker's life, incl. start-up and warm-up), ``task_s`` (NES runs with the worker's event trace, NES_EVENT_TRACE=1: sum of
-all task durations of the query's pipelines inside the span = thread time spent in the operators, source and sink
-included; ``trace_dropped`` events the trace lost, then ``task_s`` undercounts). A run's ``variant`` (meta.json) is
-appended to its system name, e.g. ``geotrellis-noavx``; ``rate_fps`` > 0 marks paced runs, whose latency columns
-come from ``nes_paced`` / ``geotrellis_paced`` (window latency, per-frame latency, time to first output, NES source
-release lag). Sliding-window runs (NES only) get ``-s<slide>`` appended to the system name. Cells (both systems, same count): width x height x bands per
-frame, i.e. real raster cells; ``cells_padded`` keeps the old count (records x bands x tile_size^2, edge padding
-included).
-"""
-
 from __future__ import annotations
 
 import csv
@@ -47,7 +20,6 @@ COLUMNS = ["system", "threads", "rep", "store", "frames", "frames_per_window", "
 
 
 def pct(values: list[float], q: float) -> float | None:
-    """Nearest-rank percentile, as the GeoTrellis runner computes it."""
     if not values:
         return None
     v = sorted(values)
@@ -61,11 +33,6 @@ def _latency_columns(window: list[float], frame: list[float], first: list[float]
 
 
 def nes_paced(run: Path, event_ms: dict[int, int], window_ms: int) -> dict[str, Any]:
-    """Latency of a paced NES run from the source's ``pacing.csv`` (scheduled and actual release per frame) and the
-    FrameLatency sink's ``frame-latency.csv`` (first and last output per source frame), both on the worker's steady
-    clock. Per frame: frame latency = last output - scheduled release, time to first output (ttfo) = first output -
-    scheduled release, release lag = actual - scheduled release. Per window (``latency_*``, as GeoTrellis reports it):
-    last output of the window's frames - scheduled release of its last frame; windows by event time // window_ms."""
     pacing, outputs = run / "pacing.csv", run / "frame-latency.csv"
     if not (pacing.exists() and outputs.exists()):
         return {}
@@ -85,31 +52,24 @@ def nes_paced(run: Path, event_ms: dict[int, int], window_ms: int) -> dict[str, 
 
 
 def geotrellis_paced(run: Path, rate_fps: float) -> dict[str, Any]:
-    """Per-frame latency of a paced GeoTrellis run from ``batches.csv``: a batch's frames arrived 1 / rate apart, the
-    last at last_arrival_ms, and all of them are done at done_ms (no output before the batch ends, so ttfo = frame
-    latency)."""
     path = run / "batches.csv"
     if rate_fps <= 0 or not path.exists():
         return {}
     frame = []
     for b in csv.DictReader(open(path)):
-        n, last, done = int(float(b["frames"])), float(b["last_arrival_ms"]), float(b["done_ms"])  # written as 2.0
+        n, last, done = int(float(b["frames"])), float(b["last_arrival_ms"]), float(b["done_ms"])
         frame += [done - (last - (n - 1 - j) * 1e3 / rate_fps) for j in range(n)]
     window = [float(b["latency_ms"]) for b in csv.DictReader(open(path))]
     return _latency_columns(window, frame, frame)
 
 
 def real_cells(m) -> int:
-    """Raster cells the run covers: width x height x bands per frame, scaled by the share of the frame's tiles present
-    (frames with missing tiles). Edge tiles are padded to full size in the store, but padding is not raster data, so it
-    is not counted (S2 at T = 256: 15 x 13 tiles = 12.78 M padded vs 3801 x 3088 = 11.74 M real cells per band)."""
     tiles = m.tiling.tiles_x * m.tiling.tiles_y
     per_frame = m.raster.width * m.raster.height * m.raster.bands
     return round(sum(per_frame * min(f.n_records, tiles) / tiles for f in m.frames))
 
 
 def read_resources(path: Path) -> list[tuple[int, int, int]]:
-    """(t_us, rss_kb, cpu_ticks) rows of a scripts/lib/sample.sh file; empty if missing."""
     if not path.exists():
         return []
     rows = []
@@ -118,12 +78,11 @@ def read_resources(path: Path) -> list[tuple[int, int, int]]:
             try:
                 rows.append((int(rec["t_us"]), int(rec["rss_kb"]), int(rec["cpu_ticks"])))
             except (KeyError, TypeError, ValueError):
-                continue                      # a row cut off when the sampler was stopped
+                continue
     return rows
 
 
 def _interp(samples: list[tuple[int, int, int]], t: int) -> float | None:
-    """CPU ticks at time t, linear between the samples around it."""
     for (t0, _, c0), (t1, _, c1) in zip(samples, samples[1:]):
         if t0 <= t <= t1:
             return c0 + (c1 - c0) * ((t - t0) / (t1 - t0) if t1 > t0 else 0.0)
@@ -131,10 +90,9 @@ def _interp(samples: list[tuple[int, int, int]], t: int) -> float | None:
 
 
 def span_resources(samples: list[tuple[int, int, int]], t0_us: int, t1_us: int, clk_tck: int) -> dict[str, Any]:
-    """Peak / mean RSS and CPU seconds of a process inside [t0, t1] from its resource samples."""
     out: dict[str, Any] = {}
     inside = [s for s in samples if t0_us <= s[0] <= t1_us]
-    if not inside:                            # span shorter than the sampling interval: nearest sample after t0
+    if not inside:
         inside = [s for s in samples if s[0] >= t0_us][:1]
     if inside:
         out["peak_rss_bytes"] = max(s[1] for s in inside) * 1024
@@ -150,7 +108,7 @@ def _nes(run: Path) -> dict[str, Any]:
     s = next((e for e in status if "local_query_id" in e), status[0]) if isinstance(status, list) else status
     if s.get("query_status") != "Stopped":
         raise ValueError(f"{run}: query_status {s.get('query_status')!r}")
-    t0, t1 = s["running"]["since_epoch"], s["stopped"]["since_epoch"]      # µs
+    t0, t1 = s["running"]["since_epoch"], s["stopped"]["since_epoch"]
     row: dict[str, Any] = {"elapsed_s": (t1 - t0) / 1e6}
     hwm = run / "worker_vmhwm"
     if hwm.exists() and hwm.read_text().split():
@@ -167,10 +125,6 @@ def _nes(run: Path) -> dict[str, Any]:
 
 
 def trace_tasks(run: Path, t0_us: int, t1_us: int) -> dict[str, Any]:
-    """Sum of task durations (µs -> s) in the worker's Chrome trace inside [t0, t1], per pipeline and in total. The
-    trace may lack its closing lines when the worker was stopped, so it is read event by event. Lost events: the trace
-    queue drops events when full (logged only at warning level, which Release builds do not print), so they are also
-    counted from the trace itself: task ends without a start (their duration is 0) and starts without an end."""
     traces = sorted(run.glob("trace_*.json"))
     if not traces:
         return {}
@@ -213,13 +167,25 @@ def _geotrellis(run: Path) -> dict[str, Any]:
             "latency_p50_ms": lat.get("p50"), "latency_p95_ms": lat.get("p95"), "latency_p99_ms": lat.get("p99")}
 
 
+def _store_manifest(root: Path, store: str):
+    name = os.path.basename(os.path.normpath(store))
+    candidates = [Path(store)]
+    candidates += [p / "stores" / name for p in root.resolve().parents]
+    candidates += [p / "manifests" / name for p in [root.resolve(), *root.resolve().parents]]
+    for c in candidates:
+        if (c / "manifest.json").is_file():
+            return TileStore.open(str(c)).manifest
+    raise FileNotFoundError(f"no manifest for store {name} (recorded path {store}); copy it to "
+                            f"<result set>/manifests/{name}/manifest.json")
+
+
 def collect(root: str | os.PathLike) -> list[dict[str, Any]]:
     manifests: dict[str, Any] = {}
     rows = []
     for meta_path in sorted(Path(root).rglob("meta.json")):
         run, meta = meta_path.parent, json.loads(meta_path.read_text())
         if meta["store"] not in manifests:
-            manifests[meta["store"]] = TileStore.open(meta["store"]).manifest
+            manifests[meta["store"]] = _store_manifest(Path(root), meta["store"])
         m = manifests[meta["store"]]
         p = parse_workload(meta["workload"]).params()
         variant = meta.get("variant") or ""

@@ -1,15 +1,3 @@
-"""Operator families as workloads.
-
-A workload is what a benchmark run computes on a tile store: its parameters,
-what side inputs it needs, what kind of output it produces, and how the
-reference result is obtained. Every stage of the pipeline (tiler, oracle,
-NES and GeoTrellis runners, comparator) dispatches on the workload, so a new
-family only needs a new subclass.
-
-Workloads serialise to JSON (``workload.json``) so NES and GeoTrellis read
-exactly the parameters the oracle used.
-"""
-
 from __future__ import annotations
 
 import json
@@ -29,8 +17,8 @@ from .tiler import tile_source
 
 
 class OutputKind(str, Enum):
-    RASTER = "raster"   # a tile store on the input grid (focal)
-    TABLE = "table"     # rows keyed by (window, zone) (zonal)
+    RASTER = "raster"
+    TABLE = "table"
 
 
 @dataclass(frozen=True)
@@ -42,7 +30,7 @@ class SideInput:
 
 @dataclass(frozen=True)
 class Note:
-    level: str          # "info" | "warning"
+    level: str
     message: str
 
 
@@ -55,10 +43,9 @@ class Workload(ABC):
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        if "family" in cls.__dict__:          # concrete families declare their own name
+        if "family" in cls.__dict__:
             _REGISTRY[cls.family] = cls
 
-    # ---- description -------------------------------------------------------
     @abstractmethod
     def params(self) -> dict[str, Any]: ...
 
@@ -74,24 +61,22 @@ class Workload(ABC):
             json.dump(self.to_dict(), fh, indent=2)
             fh.write("\n")
 
-    # ---- pipeline hooks ----------------------------------------------------
     def validate(self, manifest: Manifest) -> list[Note]:
-        """Check the workload against a store; notes are reported, not fatal."""
         return []
 
     def side_inputs(self) -> list[SideInput]:
         return []
 
     def prepare_side_inputs(self, manifest: Manifest, out_location: str) -> None:
-        """Convert side inputs into whatever the systems read (no-op for focal)."""
+        ...
 
     @abstractmethod
     def reference(self, store: TileStore, out_location: str) -> Any:
-        """Compute the oracle result for every frame of ``store`` into ``out_location``."""
+        ...
 
     @abstractmethod
     def compare(self, input_store: TileStore, reference: TileStore, candidate: TileStore, **options) -> Any:
-        """Correctness metrics of a candidate output (NES, GeoTrellis) against the reference output."""
+        ...
 
 
 def workload_from_dict(d: dict[str, Any]) -> Workload:
@@ -108,19 +93,16 @@ def load_workload(path: str) -> Workload:
 
 
 def parse_workload(spec: str) -> Workload:
-    """Short form used on the command line, e.g. ``focal:mean:square:3``."""
     family, _, rest = spec.partition(":")
     if family == "focal":
         parts = rest.split(":")
-        if len(parts) != 3:
-            raise ValueError("focal spec is focal:<op>:<shape>:<radius>, e.g. focal:mean:square:3")
-        return FocalWorkload(op=parts[0], shape=parts[1], radius=int(parts[2]))
+        if len(parts) not in (3, 4):
+            raise ValueError("focal spec is focal:<op>:<shape>:<radius>[:<nest>], e.g. focal:mean:square:3")
+        return FocalWorkload(op=parts[0], shape=parts[1], radius=int(parts[2]),
+                             nest=int(parts[3]) if len(parts) == 4 else 1)
     if family == "zonal":
         return ZonalWorkload(zones=rest)
     raise ValueError(f"unknown workload family {family!r}")
-
-
-# --------------------------------------------------------------------------- focal
 
 
 @dataclass(frozen=True)
@@ -128,6 +110,7 @@ class FocalWorkload(Workload):
     op: str
     shape: str
     radius: int
+    nest: int = 1
 
     family: ClassVar[str] = "focal"
     output_kind: ClassVar[OutputKind] = OutputKind.RASTER
@@ -139,9 +122,18 @@ class FocalWorkload(Workload):
             raise ValueError(f"shape must be one of {oracle.SHAPES}")
         if self.radius < 1:
             raise ValueError("radius must be >= 1")
+        if self.nest < 1:
+            raise ValueError("nest must be >= 1")
 
     def params(self):
-        return {"op": self.op, "shape": self.shape, "radius": self.radius}
+        p = {"op": self.op, "shape": self.shape, "radius": self.radius}
+        if self.nest > 1:
+            p["nest"] = self.nest
+        return p
+
+    @property
+    def reach(self) -> int:
+        return self.nest * self.radius
 
     def validate(self, manifest):
         notes = []
@@ -155,27 +147,20 @@ class FocalWorkload(Workload):
 
     def reference(self, store, out_location):
         m = store.manifest
-        source = FocalReferenceSource(store, self.op, self.shape, self.radius)
+        source = FocalReferenceSource(store, self.op, self.shape, self.radius, self.nest)
         return tile_source(source, backend_for(out_location), m.tiling.tile_size,
                            provenance={"role": "reference", "workload": self.to_dict(),
                                        "input_frames": {f.frame_id: f.sha256 for f in m.frames}})
 
     def compare(self, input_store, reference, candidate, **options):
         from .compare import compare_focal
-        return compare_focal(input_store, reference, candidate, self.op, self.shape, self.radius, **options)
+        return compare_focal(input_store, reference, candidate, self.op, self.shape, self.radius, nest=self.nest,
+                             **options)
 
 
 class FocalReferenceSource(RasterSource):
-    """Oracle output of a focal workload, computed strip by strip as the tiler asks for it.
-
-    For output rows [row0, row1) the oracle runs on input rows [row0 - r, row1 + r) (clipped to the raster),
-    which contain every neighbourhood of the output rows; the halo rows are then dropped. Each output cell is
-    computed from the same inputs in the same order as on the whole frame, so the result is bit-identical to
-    the untiled oracle, while memory stays proportional to one strip (width x (tile_size + 2r) cells).
-    """
-
-    def __init__(self, store, op: str, shape: str, radius: int):
-        self.store, self.op, self.radius = store, op, radius
+    def __init__(self, store, op: str, shape: str, radius: int, nest: int = 1):
+        self.store, self.op, self.radius, self.nest = store, op, radius, nest
         self.fp = oracle.footprint(shape, radius)
         self.geometry = store.manifest.raster
 
@@ -194,24 +179,15 @@ class _FocalReferenceReader(FrameReader):
 
     def read(self, row, col, rows, cols):
         src, H = self.src, self.src.geometry.height
-        a0, a1 = max(0, row - src.radius), min(H, row + rows + src.radius)
+        halo = src.nest * src.radius
+        a0, a1 = max(0, row - halo), min(H, row + rows + halo)
         x = src.store.assemble_rows(self.frame_id, a0, a1)
-        res = np.stack([oracle.focal(x[b], src.op, src.fp) for b in range(x.shape[0])])
+        res = np.stack([oracle.focal_nested(x[b], src.op, src.fp, src.nest) for b in range(x.shape[0])])
         return res[:, row - a0:row - a0 + rows, col:col + cols]
-
-
-# --------------------------------------------------------------------------- zonal
 
 
 @dataclass(frozen=True)
 class ZonalWorkload(Workload):
-    """Placeholder: fixes the interface zonal will plug into (evaluation spec §4).
-
-    Zones are polygons supplied as a static side input; the output is a table of
-    (window, zone, statistics) rows. Rasterisation rule, overlap semantics and the
-    oracle are still open, so every computing hook raises NotImplementedError.
-    """
-
     zones: str
     stats: tuple[str, ...] = ("count", "sum", "min", "max", "mean")
     inclusion: str = "center"

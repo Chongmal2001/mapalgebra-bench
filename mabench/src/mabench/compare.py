@@ -1,25 +1,3 @@
-"""Compare a candidate output store (NES, GeoTrellis) with a reference output store (oracle).
-
-Implements the correctness metrics of evaluation-spec §3.2 for raster outputs (focal):
-
-- coverage: every expected tile present exactly once;
-- NoData agreement: confusion matrix of NoData masks;
-- exact-match and tolerance-match rates; max absolute error; RMSE; max ULP distance;
-- all of it per stratum: interior, seam band, raster-edge band, near-NoData, near-missing-tile;
-- tolerance utilisation (Sum / Mean): max over cells of |a - b| / bound, so a report shows how close a result gets to
-  the bound, not only PASS / FAIL (<= 1 everywhere = within tolerance).
-
-Tiles missing from the input frame: where the candidate has an output tile there anyway (NES completes such a frame at
-the window deadline and emits every output, the missing positions flagged FILLED, computed from the neighbours with the
-gap as NoData, like the reference), it is compared as usual; where it has none, the cells are left out of every
-stratum. The neighbours of a gap are the ``near_missing_tile`` stratum. A candidate that NES imported with an expected emission multiplicity (sliding windows,
-``import-nes --windows-per-frame``) carries its multiplicity problems in its provenance; they count as coverage problems.
-
-Tolerance (spec §3.2, decision D3): Min/Max must match bit for bit. Sum must satisfy
-|a - b| <= tau * sum_{V(c)} |v|, Mean the same bound divided by |V(c)|, i.e. tau * mean_{V(c)} |v|.
-The bound scales with the magnitudes summed, so values near zero do not inflate relative errors.
-"""
-
 from __future__ import annotations
 
 import json
@@ -32,28 +10,22 @@ from scipy import ndimage as ndi
 from . import oracle
 from .store import TileStore
 
+# Sum / Mean pass if |a - b| <= tau * sum|v| over V(c) (Mean: divided by |V(c)|), Min / Max bit for bit
 DEFAULT_TAU = 1e-12
 STRATA = ("all", "interior", "seam", "raster_edge", "near_nodata", "near_missing_tile")
 
 
-# --------------------------------------------------------------------------- helpers
-
 def ulp_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Number of representable float64 values between a and b (finite inputs; 0 for equal values, incl. +0/-0)."""
     def ordered(x):
         i = np.ascontiguousarray(x, dtype=np.float64).view(np.int64)
-        i = np.where(i < 0, np.int64(-(2**63)) - i, i)       # monotone map of doubles onto int64 (-0.0 -> 0)
-        return (i.view(np.uint64) ^ np.uint64(1 << 63))       # offset binary: order-preserving, unsigned
+        i = np.where(i < 0, np.int64(-(2**63)) - i, i)  # order-preserving map of doubles onto int64
+        return (i.view(np.uint64) ^ np.uint64(1 << 63))
     ua, ub = ordered(a), ordered(b)
-    d = np.where(ua >= ub, ua - ub, ub - ua)                  # exact in uint64, no overflow
+    d = np.where(ua >= ub, ua - ub, ub - ua)
     return d.astype(np.float64)
 
 
 def _near(mask: np.ndarray, fp: np.ndarray) -> np.ndarray:
-    """True where the footprint around a cell covers a True cell of ``mask`` (zero outside the array).
-
-    Equal to ``correlate(mask, fp) > 0.5``. Footprints whose rows are centred runs (square, circle) are applied
-    as one horizontal max filter per run width plus row shifts, O(r) per cell instead of O(r^2)."""
     r = fp.shape[0] // 2
     runs = []
     for dy in range(-r, r + 1):
@@ -79,24 +51,12 @@ def _near(mask: np.ndarray, fp: np.ndarray) -> np.ndarray:
 
 def strata_masks(input_frame: np.ndarray, tile_size: int, radius: int, missing_tiles: set[tuple[int, int]],
                  fp: np.ndarray, row0: int = 0, height: int | None = None) -> dict[str, np.ndarray]:
-    """Boolean (n, W) masks per stratum, from input rows [row0, row0 + n) of a raster of total ``height``.
-
-    seam:              distance to an internal tile boundary < r (the neighbourhood crosses a tile edge)
-    raster_edge:       distance to the raster edge < r (the neighbourhood is truncated)
-    near_nodata:       some cell of N(c) is NoData in some band of the input
-    near_missing_tile: some cell of N(c) lies in a tile missing from the input frame
-    interior:          none of the above
-    Strata overlap; each one is reported on its own.
-
-    near_nodata / near_missing_tile look r rows beyond a cell, so callers working strip by strip pass input
-    rows with an r-row halo and keep only the inner rows of the result.
-    """
     _, n, W = input_frame.shape
     H = n if height is None else height
-    yy = np.arange(row0, row0 + n)[:, None]          # broadcast instead of full (n, W) coordinate grids
+    yy = np.arange(row0, row0 + n)[:, None]
     xx = np.arange(W)[None, :]
     r, s = radius, tile_size
-    # the neighbourhood of c crosses the left/right (top/bottom) edge of its tile, and a tile exists beyond it
+    # neighbourhood crosses a tile edge with a tile beyond it
     internal_x = ((xx % s < r) & (xx >= s)) | ((s - 1 - xx % s < r) & (xx // s < (W - 1) // s))
     internal_y = ((yy % s < r) & (yy >= s)) | ((s - 1 - yy % s < r) & (yy // s < (H - 1) // s))
     seam = internal_x | internal_y
@@ -114,8 +74,6 @@ def strata_masks(input_frame: np.ndarray, tile_size: int, radius: int, missing_t
     return {"all": np.ones((n, W), bool), "interior": interior, "seam": seam, "raster_edge": raster_edge,
             "near_nodata": near_nodata, "near_missing_tile": near_missing}
 
-
-# --------------------------------------------------------------------------- metrics
 
 @dataclass
 class StratumMetrics:
@@ -151,7 +109,6 @@ class StratumMetrics:
 
 
 def _metrics(cand: np.ndarray, ref: np.ndarray, tol: np.ndarray | None, mask: np.ndarray) -> StratumMetrics:
-    """cand, ref: (bands, H, W); tol: (bands, H, W) or None for exact ops; mask: (H, W)."""
     m = np.broadcast_to(mask, cand.shape)
     c, r = cand[m], ref[m]
     cn, rn = np.isnan(c), np.isnan(r)
@@ -222,7 +179,9 @@ class CompareReport:
                         f"{d['tolerance_rate']:>12.4%}{d['max_abs_error']:>12.3g}{d['max_ulp']:>10.3g}"
                         f"{d['max_tol_util']:>10.3g}")
         verdict = "PASS" if self.passed else "FAIL"
-        crit = "bitwise equality" if self.exact_op else f"|a-b| <= {self.tau:g} * sum|v| over V(c)"
+        k = self.workload["params"].get("nest", 1)
+        crit = ("bitwise equality" if self.exact_op else f"|a-b| <= {self.tau:g} * sum|v| over V(c)" if k == 1 else
+                f"|a-b| <= {k} * {self.tau:g} * op^{k}(|v|)")
         rows.append(f"{verdict} ({crit}; NoData masks must agree; all tiles present once)")
         rows += [f"coverage: {p}" for p in self.coverage_problems]
         if self.missing_input_tiles:
@@ -231,21 +190,20 @@ class CompareReport:
         return "\n".join(rows)
 
 
-# --------------------------------------------------------------------------- driver
-
 def _workload_of(store: TileStore) -> dict[str, Any] | None:
     return store.manifest.provenance.get("workload")
 
 
 def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileStore, op: str, shape: str,
                   radius: int, tau: float = DEFAULT_TAU, heatmap: str | None = None,
-                  jobs: int | str | None = 1) -> CompareReport:
-    """``jobs``: worker processes over frames (int or "auto"); results are identical to the serial run."""
+                  jobs: int | str | None = 1, nest: int = 1) -> CompareReport:
     mi, mr, mc = input_store.manifest, reference.manifest, candidate.manifest
     for name, m in (("reference", mr), ("candidate", mc)):
         if m.raster != mi.raster or m.tiling != mi.tiling:
             raise ValueError(f"{name} store has a different raster or tiling than the input store")
     workload = {"family": "focal", "params": {"op": op, "shape": shape, "radius": radius}}
+    if nest > 1:
+        workload["params"]["nest"] = nest
     for name, store in (("reference", reference), ("candidate", candidate)):
         w = _workload_of(store)
         if w is not None and w.get("params") != workload["params"]:
@@ -263,9 +221,9 @@ def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileS
 
     frames = [f.frame_id for f in mi.frames if f.frame_id in ref_ids and f.frame_id in cand_ids]
     first = mi.frames[0].frame_id
-    tasks = [(fid, op, shape, radius, tau, heatmap if fid == first else None) for fid in frames]
+    tasks = [(fid, op, shape, radius, tau, heatmap if fid == first else None, nest) for fid in frames]
     stores = (input_store, reference, candidate)
-    n = resolve_jobs(jobs, len(tasks), mi, radius)
+    n = resolve_jobs(jobs, len(tasks), mi, nest * radius)
     if n > 1 and all(st.location for st in stores):
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
@@ -274,7 +232,7 @@ def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileS
             results = list(pool.map(_worker_frame, tasks))
     else:
         results = [_compare_frame(stores, *t) for t in tasks]
-    for fid, per, problems, n_missing in results:    # frame order, as the serial loop
+    for fid, per, problems, n_missing in results:
         report.coverage_problems += problems
         report.frames[fid] = per
         if n_missing:
@@ -283,13 +241,11 @@ def compare_focal(input_store: TileStore, reference: TileStore, candidate: TileS
 
 
 def resolve_jobs(jobs: int | str | None, n_frames: int, manifest, radius: int) -> int:
-    """Worker processes: an int, or "auto" = usable cores, capped by frames and by available memory
-    (one worker holds ~12 strip-sized arrays: bands x (tile_size + 2r) x width float64)."""
     if jobs in (None, "auto"):
         import os
         cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
         per_worker = 12 * 8 * manifest.raster.bands * (manifest.tiling.tile_size + 2 * radius) * manifest.raster.width
-        per_worker += 300 * 2**20                    # interpreter, numpy, scipy
+        per_worker += 300 * 2**20
         avail = _mem_available()
         jobs = min(cores, avail // per_worker) if avail else cores
     return max(1, min(int(jobs), n_frames))
@@ -318,14 +274,14 @@ def _worker_frame(task):
     return _compare_frame(_STORES, *task)
 
 
-def _compare_frame(stores, fid: int, op: str, shape: str, radius: int, tau: float, heatmap: str | None):
-    """Metrics and coverage problems of one frame, strip by strip (one tile row each): memory ~ width x
-    (tile_size + 2r) cells per array, not the frame."""
+def _compare_frame(stores, fid: int, op: str, shape: str, radius: int, tau: float, heatmap: str | None,
+                   nest: int = 1):
     input_store, reference, candidate = stores
     mi = input_store.manifest
-    s, H, W, r = mi.tiling.tile_size, mi.raster.height, mi.raster.width, radius
+    s, H, W, r = mi.tiling.tile_size, mi.raster.height, mi.raster.width, nest * radius
     expected = {(x, y) for y in range(mi.tiling.tiles_y) for x in range(mi.tiling.tiles_x)}
-    fp = oracle.footprint(shape, radius)
+    fp_op = oracle.footprint(shape, radius)
+    fp = oracle.footprint_nested(fp_op, nest)
     problems = []
     with input_store.frame_rows(fid) as xin, reference.frame_rows(fid) as xref, candidate.frame_rows(fid) as xcand:
         in_keys, cand_keys = xin.keys, xcand.keys
@@ -341,16 +297,17 @@ def _compare_frame(stores, fid: int, op: str, shape: str, radius: int, tau: floa
         hm = _Heatmap(H, W) if heatmap is not None else None
         for y0 in range(0, H, s):
             y1 = min(H, y0 + s)
-            a0, a1 = max(0, y0 - r), min(H, y1 + r)           # input rows incl. r-row halo
+            a0, a1 = max(0, y0 - r), min(H, y1 + r)
             inner = slice(y0 - a0, y0 - a0 + (y1 - y0))
             x = xin.rows(a0, a1)
             ref, cand = xref.rows(y0, y1), xcand.rows(y0, y1)
             tol = None
             if op in ("sum", "mean"):
                 absx = np.where(np.isnan(x), np.nan, np.abs(x))
-                tol = tau * np.stack([oracle.focal(absx[b], op, fp)[inner] for b in range(x.shape[0])])
+                tol = (nest * tau) * np.stack([oracle.focal_nested(absx[b], op, fp_op, nest)[inner]
+                                               for b in range(x.shape[0])])
                 tol = np.where(np.isnan(tol), 0.0, tol)
-            masks = strata_masks(x, s, radius, missing_input, fp, row0=a0, height=H)
+            masks = strata_masks(x, s, r, missing_input, fp, row0=a0, height=H)
             present = np.ones((y1 - y0, W), bool)
             for tx, ty in missing_input - set(cand_keys):
                 if ty * s < y1 and (ty + 1) * s > y0:
@@ -360,34 +317,30 @@ def _compare_frame(stores, fid: int, op: str, shape: str, radius: int, tau: floa
             if hm is not None:
                 hm.add(y0, cand, ref)
     if hm is not None:
-        hm.write(heatmap, s, f"{op}:{shape}:{radius}, frame {fid}")
+        hm.write(heatmap, s, f"{op}:{shape}:{radius}" + (f" nested x{nest}" if nest > 1 else "") + f", frame {fid}")
     return fid, per, problems, len(missing_input - set(cand_keys))
 
 
 class _Heatmap:
-    """Error map of one frame, accumulated strip by strip and reduced to at most ``max_px`` pixels per side
-    (block maximum), so a 20000 x 20000 frame never has to exist as a full error array or a full-size image."""
-
     def __init__(self, height: int, width: int, max_px: int = 2000):
-        self.f = max(1, -(-max(height, width) // max_px))       # block size (ceil division)
+        self.f = max(1, -(-max(height, width) // max_px))
         self.err = np.zeros((-(-height // self.f), -(-width // self.f)))
         self.mismatch = np.zeros(self.err.shape, bool)
         self.height, self.width = height, width
 
     def _blocks(self, y0: int, a: np.ndarray, reduce) -> None:
-        """Reduce a (n, W) strip into the block grid, combining with what earlier strips put there."""
         f, n, W = self.f, a.shape[0], a.shape[1]
         cols = -(-W // f)
         pad = np.zeros((n, cols * f), a.dtype)
         pad[:, :W] = a
-        colred = pad.reshape(n, cols, f).max(axis=2)              # block max along columns
+        colred = pad.reshape(n, cols, f).max(axis=2)
         rows = (np.arange(y0, y0 + n) // f)
         for g in np.unique(rows):
             reduce(g, colred[rows == g].max(axis=0))
 
     def add(self, y0: int, cand: np.ndarray, ref: np.ndarray) -> None:
         diff = np.abs(cand - ref)
-        err = np.where(np.isnan(diff), 0.0, diff).max(axis=0)     # worst band; equal NoData counts as 0
+        err = np.where(np.isnan(diff), 0.0, diff).max(axis=0)
         mismatch = (np.isnan(cand) != np.isnan(ref)).any(axis=0)
         self._blocks(y0, err, lambda g, v: np.maximum(self.err[g], v, out=self.err[g]))
         self._blocks(y0, mismatch, lambda g, v: np.logical_or(self.mismatch[g], v, out=self.mismatch[g]))
@@ -413,7 +366,7 @@ def _write_heatmap(path: str, err: np.ndarray, nodata_mismatch: np.ndarray, tile
         ys, xs = np.nonzero(nodata_mismatch)
         ax.scatter(xs, ys, s=2, c="red", label="NoData mismatch")
         ax.legend(loc="upper right", fontsize=8)
-    if tile_px >= 4:                                         # tile lines only while they stay readable
+    if tile_px >= 4:
         for k in np.arange(tile_px, err.shape[1], tile_px):
             ax.axvline(k - 0.5, color="white", lw=0.4, alpha=0.6)
         for k in np.arange(tile_px, err.shape[0], tile_px):

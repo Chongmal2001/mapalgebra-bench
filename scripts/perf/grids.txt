@@ -10,9 +10,12 @@
 G1    sub4                  mean,max:square,circle:1,2,4,8,16
 # G1 NES kernels for square Mean: exact and plain running next to the default (nes, line above)
 G1    sub4                  mean:square:1,2,4,8,16        "SYSTEMS=nes-exact nes-running"
-# G2 threads: NES workers vs threaded GeoTrellis (same thread count, GT_THREADS = PERF_THREADS); trim to the machine's
-# cores with FILTER="PERF_THREADS=1,2,4,8", and make sure DOCKER_CPUSET / GT_CPUSET (pinning) allow that many cores
-G2    sub4                  mean,max:square,circle:4,16   PERF_THREADS=1,2,4,8,16
+# G2 threads: NES workers vs threaded GeoTrellis (same thread count, GT_THREADS = PERF_THREADS); each run is pinned to
+# cores 0..T-1 (CPUSET_PER_THREAD=1), overriding DOCKER_CPUSET / GT_CPUSET. Trim to the machine's cores with
+# FILTER="PERF_THREADS=1,2,4,8". The first final G2 run (2026-11-21) inherited DOCKER_CPUSET=2 from the VM's
+# bench.local.env, so every thread count ran on one core; its runs with more than one thread were discarded and rerun
+# with this line (2026-11-22). The single-thread runs are shared with G1 and kept
+G2    sub4                  mean,max:square,circle:4,16   PERF_THREADS=1,2,4,8,16 CPUSET_PER_THREAD=1
 # G3 tile size, NES only: per-tile cost (tuples, frame-state slots, output tasks, probe tasks) falls with T, halo copy
 # ((T + 2r) / T)^2 falls with T, parallelism and emission granularity fall with T; expected U-shaped cost. Same 4 scenes.
 # Compensated mean isolates tiling cost (kernel independent of r); exact max shows how kernel cost dilutes it
@@ -20,7 +23,7 @@ G3    halo4,t32,t64,t128,sub4,t512,t1024  mean,max:square:1,16  SYSTEMS=nes
 # G4 frames: constant per-frame cost justifies frame subsets
 G4    sub2,sub4,sub8,perf   max:square:4
 # G5 instruction set: GeoTrellis with and without SIMD (explains VM vs laptop)
-G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis
+G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis VARIANT=avx
 G5    sub4                  mean,max:square:4,16          SYSTEMS=geotrellis VARIANT=noavx "GT_JAVA_OPTS=-XX:UseAVX=0 -XX:UseSSE=2"
 # G6 latency under paced load, 16 frames. Rates shared by both systems, about 50 % and 85-90 % of the slower system's
 # capacity on this store (VM, 1 thread): max r4 GeoTrellis ~0.038 frames/s (26 s per frame from frame 6 on), mean r4

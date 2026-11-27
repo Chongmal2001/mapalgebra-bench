@@ -1,10 +1,3 @@
-"""Store manifest: raster-level invariants, tiling, frames, provenance.
-
-Raster-level invariants (grid, CRS, transform, tiling scheme) live here once,
-not in every record, matching the NES design rule that they are resolved when
-the operator opens.
-"""
-
 from __future__ import annotations
 
 import json
@@ -24,7 +17,7 @@ class RasterInfo:
     width: int
     height: int
     bands: int
-    transform: tuple[float, float, float, float, float, float] | None  # affine a, b, c, d, e, f
+    transform: tuple[float, float, float, float, float, float] | None
     crs: str | None
 
 
@@ -33,8 +26,8 @@ class TilingInfo:
     tile_size: int
     tiles_x: int
     tiles_y: int
-    tile_order: str = "row-major"   # order of records inside a frame file
-    edge_padding: str = "nan"       # partial edge tiles are padded to tile_size with NoData
+    tile_order: str = "row-major"
+    edge_padding: str = "nan"
 
 
 @dataclass(frozen=True)
@@ -45,7 +38,7 @@ class FrameInfo:
     n_records: int
     nbytes: int
     sha256: str
-    valid_cells: int                # non-NoData cells inside the true raster extent
+    valid_cells: int
     source: dict[str, Any] = field(default_factory=dict)
 
 

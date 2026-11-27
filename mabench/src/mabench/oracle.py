@@ -1,11 +1,3 @@
-"""Reference implementation of the focal semantics (evaluation spec §3.1).
-
-Works on the untiled frame: no tiles, halos or windows. Truncate edges plus
-NoData-ignoring reductions are expressed as zero-fill (sum, count) and
-+/-inf-fill (min, max) filters. ``naive_focal`` is the literal per-cell
-definition and exists to validate ``focal`` on small rasters.
-"""
-
 from __future__ import annotations
 
 import numpy as np
@@ -27,12 +19,7 @@ def footprint(shape: str, radius: int) -> np.ndarray:
 
 
 def _window_sum(x: np.ndarray, fp: np.ndarray) -> np.ndarray:
-    """Sum of x over the footprint around every cell, zero outside the array.
-
-    An all-ones (square) footprint is applied as two 1-D passes (rows, then columns): O(r) per cell instead
-    of O(r^2). Rounding differs from a cell-by-cell sum by at most ~(2r+1)·u·sum|v|, far inside the spec
-    tolerance for the radii in the benchmark; masked footprints (circle) use the direct 2-D correlation.
-    """
+    # square: two 1-D passes, O(r) per cell
     if fp.all():
         ones = np.ones(fp.shape[0])
         rows = ndi.correlate1d(x, ones, axis=1, mode="constant", cval=0.0)
@@ -41,7 +28,6 @@ def _window_sum(x: np.ndarray, fp: np.ndarray) -> np.ndarray:
 
 
 def focal(a: np.ndarray, op: str, fp: np.ndarray) -> np.ndarray:
-    """2-D float64 array with NaN NoData -> focal result, NaN where no valid neighbour exists."""
     valid = ~np.isnan(a)
     if op in ("sum", "mean"):
         s = _window_sum(np.where(valid, a, 0.0), fp)
@@ -58,8 +44,24 @@ def focal(a: np.ndarray, op: str, fp: np.ndarray) -> np.ndarray:
     raise ValueError(f"unknown op {op!r}")
 
 
+def focal_nested(a: np.ndarray, op: str, fp: np.ndarray, nest: int = 1) -> np.ndarray:
+    for _ in range(nest):
+        a = focal(a, op, fp)
+    return a
+
+
+def footprint_nested(fp: np.ndarray, nest: int = 1) -> np.ndarray:
+    out = fp
+    for _ in range(nest - 1):
+        r_out, r = out.shape[0] // 2, fp.shape[0] // 2
+        grown = np.zeros((2 * (r_out + r) + 1,) * 2, bool)
+        for dy, dx in np.argwhere(fp):
+            grown[dy:dy + out.shape[0], dx:dx + out.shape[1]] |= out
+        out = grown
+    return out
+
+
 def naive_focal(a: np.ndarray, op: str, fp: np.ndarray) -> np.ndarray:
-    """Literal definition, one cell at a time. Slow; for validation only."""
     H, W = a.shape
     r = fp.shape[0] // 2
     reduce = {"sum": sum, "mean": lambda v: sum(v) / len(v), "min": min, "max": max}[op]

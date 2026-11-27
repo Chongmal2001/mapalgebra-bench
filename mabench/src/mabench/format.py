@@ -1,48 +1,3 @@
-"""Byte layout of the tile store, record version 4 (self-locating maplets).
-
-This module is the Python source of truth for the bytes shared by the tiler, NES (raster plugin,
-``MapletCodec`` wire format 3) and the GeoTrellis baseline (``tilestore/Format.scala``). The contract is
-``docs/maplet-format.md`` section 5; any change here must be mirrored there, in Scala and in the NES codec.
-
-A frame file (``frames/fNNNNNN.mpl``) is one frame header block followed by ``n_tiles`` maplet blocks::
-
-    frame header, 112 B, struct <8sIIQIIIIBBHIdII6d
-    +0    char[8] magic          "MPLFRM04"
-    +8    u32     frame_id       file sequence number (mabench bookkeeping; NES ignores it)
-    +12   u32     n_tiles        tiles_x * tiles_y
-    +16   u64     event_time_ms  one event time for the whole frame
-    +24   u32     raster_width   W, true extent before padding
-    +28   u32     raster_height  H
-    +32   u32     tile_width     T_w
-    +36   u32     tile_height    T_h
-    +40   u8      bands
-    +41   u8      cellType       1 = Float64
-    +42   u16     flags          0
-    +44   u32     reserved       0
-    +48   f64     noData         NaN; the only NoData field in the file
-    +56   u32     crs_epsg       0 = unknown
-    +60   u32     reserved       0
-    +64   f64[6]  transform      affine a, b, c, d, e, f (rasterio / GDAL order)
-
-    maplet, 32 B preamble + cells, struct <BBBBIiiIIII
-    +0    u8   format          3
-    +1    u8   cellType        1 = Float64
-    +2    u8   bands           1..255
-    +3    u8   flags           bit 0 = FILLED (tile synthesised by an operator, not observed)
-    +4    u32  frame_id        0 in files = unassigned; the NES source assigns it
-    +8    i32  tile_x
-    +12   i32  tile_y
-    +16   u32  height          T_h
-    +20   u32  width           T_w
-    +24   u32  raster_width    W
-    +28   u32  raster_height   H
-    +32   f64[bands*height*width] cells, band-major, row-major within a band; padding = NaN
-
-Maplet i starts at ``112 + i * (32 + 8 * bands * T_h * T_w)``; every offset is a multiple of 8, so cells can be
-viewed in place (mmap, ``DoubleBuffer``, ``reinterpret_cast``). Maplets carry no NoData: interpretation comes from
-the raster level (frame header, manifest).
-"""
-
 from __future__ import annotations
 
 import math
@@ -54,6 +9,7 @@ from typing import Iterator, Sequence
 import numpy as np
 
 RECORD_VERSION = 4
+# byte layout: docs/maplet-format.md §5, mirrored in Format.scala and the NES MapletCodec
 FRAME_MAGIC = b"MPLFRM04"
 FRAME_HEADER = struct.Struct("<8sIIQIIIIBBHIdII6d")
 MAPLET_PREAMBLE = struct.Struct("<BBBBIiiIIII")
@@ -64,26 +20,23 @@ CELL_TYPE_FLOAT64 = 1
 MAX_BANDS = 255
 NODATA = float("nan")
 CELL_DTYPE = np.dtype("<f8")
-FLAG_FILLED = 0x01                   # maplet synthesised by an operator (NoData fill), not observed data
-FLAG_LATE = 0x02                     # tile stores only: maplet of an earlier frame (named by frame_id), arriving late
+FLAG_FILLED = 0x01  # synthesised by an operator, not observed
+FLAG_LATE = 0x02  # store files only: maplet of an earlier frame
 IDENTITY_TRANSFORM = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
 
 def crs_to_epsg(crs: str | None) -> int:
-    """EPSG code of a CRS string, 0 if there is none or it has no EPSG code."""
     if not crs:
         return 0
     m = re.fullmatch(r"\s*EPSG:(\d+)\s*", crs, re.I)
     if m:
         return int(m.group(1))
-    try:                                         # WKT / PROJ strings: let rasterio find the code
+    try:
         from rasterio.crs import CRS
         return CRS.from_user_input(crs).to_epsg() or 0
     except Exception:
         return 0
 
-
-# ---------------------------------------------------------------- frame header
 
 @dataclass(frozen=True)
 class FrameHeader:
@@ -121,7 +74,6 @@ class FrameHeader:
         return self.maplet_offset(self.n_tiles)
 
     def maplet_header(self, tile_x: int, tile_y: int, frame_id: int = 0, flags: int = 0) -> "MapletHeader":
-        """Preamble of a maplet of this frame at (tile_x, tile_y)."""
         return MapletHeader(self.bands, tile_x, tile_y, self.tile_height, self.tile_width,
                             self.raster_width, self.raster_height, frame_id, flags)
 
@@ -151,7 +103,7 @@ class FrameHeader:
         if not (W and H and tw and th and bands):
             raise ValueError("frame header has a zero dimension")
         h = cls(fid, n, ts, W, H, tw, th, bands, epsg, tuple(transform), nodata, ctype, flags)
-        if n > h.tiles_x * h.tiles_y:     # fewer is legal framing (an output that lost tiles); verify reports it
+        if n > h.tiles_x * h.tiles_y:  # fewer is legal framing, verify reports it
             raise ValueError(f"frame header says {n} tiles, grid {h.tiles_x}x{h.tiles_y} has {h.tiles_x * h.tiles_y}")
         return h
 
@@ -159,8 +111,6 @@ class FrameHeader:
 def unpack_frame_header(buf) -> FrameHeader:
     return FrameHeader.unpack_from(buf)
 
-
-# ---------------------------------------------------------------- maplet
 
 @dataclass(frozen=True)
 class MapletHeader:
@@ -184,7 +134,6 @@ class MapletHeader:
 
     @property
     def valid_rows(self) -> int:
-        """Rows of this tile inside the raster extent (the rest is padding)."""
         return max(0, min(self.height, self.raster_height - self.tile_y * self.height))
 
     @property
@@ -213,7 +162,6 @@ class MapletHeader:
 
 
 def encode_maplet(header: MapletHeader, cells: np.ndarray) -> bytes:
-    """Preamble + cells. ``cells`` is (bands, height, width), or (height, width) for one band."""
     cells = np.asarray(cells, dtype=CELL_DTYPE)
     if cells.ndim == 2:
         cells = cells[None]
@@ -224,7 +172,6 @@ def encode_maplet(header: MapletHeader, cells: np.ndarray) -> bytes:
 
 
 def decode_maplet(buf, offset: int = 0) -> tuple[MapletHeader, np.ndarray]:
-    """(header, cells) of the maplet at ``offset``; cells are a read-only view into ``buf``."""
     h = MapletHeader.unpack_from(buf, offset)
     if len(buf) - offset < h.nbytes:
         raise ValueError(f"maplet at offset {offset} needs {h.nbytes} bytes, {len(buf) - offset} left")
@@ -233,7 +180,6 @@ def decode_maplet(buf, offset: int = 0) -> tuple[MapletHeader, np.ndarray]:
 
 
 def check_maplet(frame: FrameHeader, h: MapletHeader) -> None:
-    """The source checks of maplet-format.md 5.5 that need no cell decoding (duplicates excepted)."""
     if (h.bands, h.height, h.width, h.raster_width, h.raster_height) != \
             (frame.bands, frame.tile_height, frame.tile_width, frame.raster_width, frame.raster_height):
         raise ValueError(f"maplet ({h.tile_x},{h.tile_y}) shape {(h.bands, h.height, h.width)} / raster "
@@ -243,8 +189,6 @@ def check_maplet(frame: FrameHeader, h: MapletHeader) -> None:
 
 
 def iter_maplets(buf) -> Iterator[tuple[MapletHeader, np.ndarray]]:
-    """(maplet header, cells view) for every maplet of a frame file, checked against the frame header.
-    The frame header itself is ``unpack_frame_header(buf)``."""
     frame = FrameHeader.unpack_from(buf)
     if len(buf) != frame.file_nbytes:
         kind = "trailing bytes" if len(buf) > frame.file_nbytes else "truncated"
@@ -256,7 +200,6 @@ def iter_maplets(buf) -> Iterator[tuple[MapletHeader, np.ndarray]]:
 
 
 def encode_frame(frame: FrameHeader, tiles: Sequence[tuple[MapletHeader, np.ndarray]]) -> bytes:
-    """A whole frame file in memory (tests, small stores). The tiler streams instead."""
     if len(tiles) != frame.n_tiles:
         frame = replace(frame, n_tiles=len(tiles))
     return frame.pack() + b"".join(encode_maplet(h, c) for h, c in tiles)

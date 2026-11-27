@@ -14,12 +14,11 @@ from mabench.workloads import FocalWorkload
 
 
 def _store_from_arrays(path, like: TileStore, frames, workload=None, skip_tiles=()):
-    """Write arrays (one (bands, H, W) per frame) as a tile store with the tiling of `like`."""
     m = like.manifest
     src = ArraySource(m.raster, [(f.frame_id, f.event_time_ms, a) for f, a in zip(m.frames, frames)])
     out = tile_source(src, backend_for(path), m.tiling.tile_size,
                       provenance={"role": "candidate", **({"workload": workload.to_dict()} if workload else {})})
-    if skip_tiles:   # drop records to simulate a system that lost tiles
+    if skip_tiles:
         from mabench import format as fmt
         for info in out.frames:
             buf = bytes(TileStore.open(path).backend.read_buffer(info.key))
@@ -53,7 +52,7 @@ def test_identical_candidate_passes(setup):
 def test_tolerance_is_scaled_by_neighbourhood_magnitude(setup):
     tmp, inp, ref, w = setup
     frames = [ref.assemble(f.frame_id) for f in ref.manifest.frames]
-    tiny = [a * (1 + 1e-15) for a in frames]                       # last-ULP drift, like sliding sums
+    tiny = [a * (1 + 1e-15) for a in frames]
     assert w.compare(inp, ref, _store_from_arrays(tmp / "tiny", inp, tiny, w)).passed
     big = [a + 1e-6 for a in frames]
     rep = w.compare(inp, ref, _store_from_arrays(tmp / "big", inp, big, w))
@@ -110,7 +109,6 @@ def test_ulp_distance():
 
 
 def _one_tile_halo_model(frame, op, shape, r, s):
-    """Model of the hypothesised GeoTrellis behaviour: each tile only sees its 8 neighbour tiles."""
     _, H, W = frame.shape
     out = np.full_like(frame, np.nan)
     fp = oracle.footprint(shape, r)
@@ -126,7 +124,6 @@ def _one_tile_halo_model(frame, op, shape, r, s):
 
 @pytest.mark.parametrize("r,should_pass", [(3, True), (16, True), (20, False)])
 def test_one_tile_halo_is_exact_iff_radius_fits_in_a_tile(setup, r, should_pass):
-    """Locality argument (spec §3.2): a halo of one tile is enough exactly when r <= tile size."""
     tmp, inp, _, _ = setup
     w = FocalWorkload("max", "square", r)
     w.reference(inp, str(tmp / f"ref{r}"))
@@ -135,7 +132,7 @@ def test_one_tile_halo_is_exact_iff_radius_fits_in_a_tile(setup, r, should_pass)
     rep = w.compare(inp, ref, _store_from_arrays(tmp / f"halo{r}", inp, frames, w))
     assert rep.passed == should_pass
     if not should_pass:
-        assert rep.totals()["interior"].data_both == rep.totals()["interior"].exact   # errors only where halos reach far
+        assert rep.totals()["interior"].data_both == rep.totals()["interior"].exact
 
 
 def test_cli_compare(setup, tmp_path, capsys):
@@ -157,9 +154,6 @@ def test_cli_compare(setup, tmp_path, capsys):
               "--workload", "focal:max:square:2"])
 
 
-# --------------------------------------------------------------------------- strip-wise processing
-
-
 def _nodata_store(tmp, tile=16, bands=2):
     src = SyntheticSource(53, 70, "normal", {"nodata_fraction": 0.05, "nodata_block": [20, 3, 41, 25]},
                           bands=bands, n_frames=2, seed=7)
@@ -179,7 +173,6 @@ def test_assemble_rows_equals_slices_of_assemble(tmp_path):
 @pytest.mark.parametrize("op,shape,r", [("mean", "square", 3), ("sum", "circle", 5), ("max", "square", 20),
                                          ("min", "circle", 2)])
 def test_strip_reference_is_bit_identical_to_whole_frame_oracle(tmp_path, op, shape, r):
-    """The reference is computed strip by strip with an r-row halo; r = 20 > tile size 16 spans several strips."""
     store = _nodata_store(tmp_path)
     w = FocalWorkload(op, shape, r)
     w.reference(store, str(tmp_path / "ref"))
@@ -189,7 +182,7 @@ def test_strip_reference_is_bit_identical_to_whole_frame_oracle(tmp_path, op, sh
         x = store.assemble(f.frame_id)
         whole = np.stack([oracle.focal(x[b], op, fp) for b in range(x.shape[0])])
         got = ref.assemble(f.frame_id)
-        assert np.array_equal(got.view(np.int64), whole.view(np.int64))  # bitwise, NaN payloads included
+        assert np.array_equal(got.view(np.int64), whole.view(np.int64))
 
 
 def test_strata_masks_strip_equals_whole_frame():
@@ -208,7 +201,7 @@ def test_strata_masks_strip_equals_whole_frame():
 
 def test_heatmap_blocks_keep_the_maximum(tmp_path):
     from mabench.compare import _Heatmap
-    hm = _Heatmap(10, 7, max_px=3)                              # block size 4
+    hm = _Heatmap(10, 7, max_px=3)
     ref = np.zeros((1, 10, 7))
     cand = ref.copy()
     cand[0, 9, 6] = 5.0
@@ -266,16 +259,14 @@ def test_tiles_missing_from_the_input_are_not_compared(tmp_path):
     w = FocalWorkload("sum", "square", 2)
     w.reference(inp, str(tmp_path / "ref"))
     ref = TileStore.open(tmp_path / "ref")
-    # a streaming candidate: everything but the tile that never arrived
     cand = _store_from_arrays(tmp_path / "cand", inp, [ref.assemble(f.frame_id) for f in ref.manifest.frames], w,
                               skip_tiles={(1, 1)})
     rep = w.compare(inp, ref, cand)
     assert rep.passed, rep.table()
     assert rep.missing_input_tiles == {0: 1, 1: 1}
     t = rep.totals()
-    assert t["all"].cells == 2 * (40 * 30 - 100)                    # the missing tile's cells are left out
+    assert t["all"].cells == 2 * (40 * 30 - 100)
     assert t["near_missing_tile"].cells > 0 and t["near_missing_tile"].nodata_only_candidate == 0
-    # NES emits the missing positions too (FILLED, from the neighbours): then they are compared
     full = _store_from_arrays(tmp_path / "full", inp, [ref.assemble(f.frame_id) for f in ref.manifest.frames], w)
     rep = w.compare(inp, ref, full)
     assert rep.passed and not rep.missing_input_tiles and rep.totals()["all"].cells == 2 * 40 * 30

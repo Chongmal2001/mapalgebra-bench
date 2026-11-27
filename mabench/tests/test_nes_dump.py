@@ -1,5 +1,3 @@
-"""import-nes: synthetic NES Binary dumps built from oracle outputs, with injected faults (bench-capabilities 9.1)."""
-
 import json
 import random
 from dataclasses import replace
@@ -21,7 +19,6 @@ REFS = [("tiny-1b", "sum-square-1"), ("tiny-1b", "mean-circle-2"), ("tiny-2b", "
 
 @pytest.fixture(scope="session")
 def stores(tmp_path_factory):
-    """Small stores and their oracle outputs, generated once per test session (nothing committed)."""
     root = tmp_path_factory.mktemp("stores")
     synth = {"tiny-1b": ["--width", "8", "--height", "8", "--generator", "ramp", "--frames", "3"],
              "tiny-2b": ["--width", "10", "--height", "6", "--generator", "normal", "--bands", "2", "--frames", "2",
@@ -36,8 +33,6 @@ def stores(tmp_path_factory):
 
 
 def _records(ref: TileStore, src_id=1):
-    """(srcId, srcFrameId, ts, maplet bytes) per tile, as NES would emit them: maplet frame_id = output frame number
-    from 1 (here input frame id + 1), in an interleaved, shuffled order."""
     out = []
     for info in ref.manifest.frames:
         for h, cells in ref.records(info.frame_id):
@@ -71,7 +66,6 @@ def test_clean_dump_reproduces_the_reference_byte_for_byte(env):
     m, rep = import_nes(_write_dump(tmp / "d.bin", recs), inp, w, str(tmp / "out"))
     out = TileStore.open(tmp / "out")
     assert out.verify().ok and not rep.notes()
-    # same frame header, maplets in row-major order with frame_id 0 / flags 0, same cells -> same file bytes
     assert [f.sha256 for f in m.frames] == [f.sha256 for f in ref.manifest.frames]
     assert m.provenance["role"] == "nes" and m.provenance["workload"] == w.to_dict()
     assert m.provenance["nes"]["out_frame_of"] == {0: 1, 1: 2}
@@ -114,7 +108,7 @@ def test_filled_flag_goes_to_provenance_not_into_the_file(env):
     m, rep = import_nes(_write_dump(tmp / "d.bin", recs), inp, w, str(tmp / "out"))
     assert rep.filled_tiles == {0: [[h.tile_x, h.tile_y]]}
     assert m.provenance["nes"]["filled_tiles"] == {0: [[h.tile_x, h.tile_y]]}
-    assert TileStore.open(tmp / "out").verify().ok          # flags 0 in the file
+    assert TileStore.open(tmp / "out").verify().ok
 
 
 def test_framing_errors(env):
@@ -164,13 +158,13 @@ def test_src_id_filter_and_frames_without_output(env):
 
 def test_padding_that_is_not_nodata_is_kept_and_reported(env):
     tmp, inp, ref, w, recs = env
-    r = next(r for r in recs if fmt.MapletHeader.unpack_from(r[3]).tile_x == 2)   # 10 px wide, 4 px tiles: padded
+    r = next(r for r in recs if fmt.MapletHeader.unpack_from(r[3]).tile_x == 2)
     cells = bytearray(r[3])
-    cells[-8:] = np.float64(0.0).tobytes()                    # last cell of the last band lies in the padding
+    cells[-8:] = np.float64(0.0).tobytes()
     r[3] = bytes(cells)
     _, rep = import_nes(_write_dump(tmp / "d.bin", recs), inp, w, str(tmp / "out"))
     assert sum(len(v) for v in rep.padding_not_nodata.values()) == 1
-    assert w.compare(inp, ref, TileStore.open(tmp / "out")).passed          # compare ignores padding
+    assert w.compare(inp, ref, TileStore.open(tmp / "out")).passed
 
 
 def test_cli_import_then_compare(env, stores, capsys):
@@ -188,7 +182,6 @@ def test_cli_import_then_compare(env, stores, capsys):
         bad = tmp / "bad.bin"
         bad.write_bytes(b"x\n")
         main(["import-nes", str(bad), "--input", str(INPUT), "--workload", WORKLOAD, "--out", str(tmp / "o3")])
-    # a workload that disagrees with the reference is refused by compare
     main(["import-nes", dump, "--input", str(INPUT), "--workload", "focal:sum:square:1", "--out", str(tmp / "o4")])
     with pytest.raises(ValueError, match="was produced by workload"):
         main(["compare", str(tmp / "o4"), "--reference", str(REF), "--input", str(INPUT)])
@@ -218,7 +211,7 @@ def test_schema_line_is_matched_case_insensitively(env):
     tmp, inp, ref, w, recs = env           # NES upper-cases unquoted identifiers when it prints the sink schema
     _, rep = import_nes(_write_dump(tmp / "d.bin", recs, header=DUMP_HEADER_LINE.upper()), inp, w, str(tmp / "out"))
     assert w.compare(inp, ref, TileStore.open(tmp / "out")).passed
-    with pytest.raises(ValueError, match="schema line"):    # order still matters
+    with pytest.raises(ValueError, match="schema line"):
         bad = b"SRCFRAMEID:UINT32:NOT_NULLABLE,SRCID:UINT32:NOT_NULLABLE,TS:UINT64:NOT_NULLABLE,RASTER:VARSIZED:NOT_NULLABLE\n"
         import_nes(_write_dump(tmp / "e.bin", recs, header=bad), inp, w, str(tmp / "o2"))
 
@@ -279,7 +272,6 @@ def test_nes_query_frames_per_window(stores):
 
 
 def test_sliding_windows_multiplicity(env):
-    """Each frame emitted in 2 windows under different output frame numbers: one copy kept, multiplicity checked."""
     tmp, inp, ref, w, recs = env
     second = [[s, f, ts, _patch(m, frame_id=fmt.MapletHeader.unpack_from(m).frame_id + 10)] for s, f, ts, m in recs]
     m, rep = import_nes(_write_dump(tmp / "d.bin", recs + second), inp, w, str(tmp / "out"), windows_per_frame=2)
@@ -287,7 +279,6 @@ def test_sliding_windows_multiplicity(env):
     assert rep.multiplicity == {0: {2: 6}, 1: {2: 6}}
     assert [f.sha256 for f in m.frames] == [f.sha256 for f in ref.manifest.frames]
     assert w.compare(inp, ref, TileStore.open(tmp / "out")).passed
-    # one tile emitted only once: reported, and compare fails
     short = second[1:]
     _, rep = import_nes(_write_dump(tmp / "d2.bin", recs + short), inp, w, str(tmp / "out2"), windows_per_frame=2)
     assert len(rep.multiplicity_problems) == 1 and "emitted 1x, expected 2x" in rep.multiplicity_problems[0]
@@ -311,9 +302,8 @@ def test_windows_containing_and_per_frame_expectation(env):
     from mabench.nes_dump import window_ms, windows_containing
     assert [windows_containing(t, 200, 100) for t in (0, 50, 100, 250)] == [1, 1, 2, 2]
     assert [windows_containing(t, 100, 100) for t in (0, 100, 999)] == [1, 1, 1]
-    tmp, inp, ref, w, recs = env                       # tiny-2b: frames at 0 and 100 ms
+    tmp, inp, ref, w, recs = env
     assert window_ms(inp, 2, 1) == (200, 100)
-    # frame 0 (t = 0) is in one sliding window, frame 1 in two
     second = [[s, f, ts, _patch(m, frame_id=fmt.MapletHeader.unpack_from(m).frame_id + 10)] for s, f, ts, m in recs
               if f == 1]
     _, rep = import_nes(_write_dump(tmp / "d.bin", recs + second), inp, w, str(tmp / "out"), frames_per_window=2,

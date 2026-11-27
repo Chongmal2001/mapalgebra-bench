@@ -18,10 +18,8 @@ from mabench.workloads import (FocalWorkload, OutputKind, ZonalWorkload, load_wo
                                parse_workload, workload_from_dict)
 
 
-REPO = __import__("pathlib").Path(__file__).resolve().parents[2]   # repository root (mabench/tests/..)
+REPO = __import__("pathlib").Path(__file__).resolve().parents[2]
 
-
-# ---------------------------------------------------------------- format
 
 def test_frame_header_layout_is_fixed():
     h = fmt.FrameHeader(7, 6, 123456789012, 70, 45, 32, 16, 3, 32633, (10.0, 0.0, 3e5, 0.0, -10.0, 5.8e6))
@@ -47,7 +45,7 @@ def test_maplet_layout_is_fixed():
     blob = fmt.encode_maplet(h, cells)
     assert len(blob) == h.nbytes == 32 + 60 * 8
     assert struct.unpack_from("<BBBBIiiIIII", blob) == (3, 1, 3, 1, 9, -1, 2, 4, 5, 70, 45)
-    assert np.array_equal(np.frombuffer(blob, "<f8", offset=32), np.arange(60.0))   # band-major, row-major
+    assert np.array_equal(np.frombuffer(blob, "<f8", offset=32), np.arange(60.0))
     h2, c2 = fmt.decode_maplet(blob)
     assert h2 == h and np.array_equal(c2, cells)
     with pytest.raises(ValueError, match="do not match"):
@@ -73,7 +71,7 @@ def test_frame_file_framing_is_checked():
         list(fmt.iter_maplets(good + b"x"))
     with pytest.raises(ValueError, match="truncated"):
         list(fmt.iter_maplets(good[:-1]))
-    wrong = fmt.MapletHeader(1, 0, 0, 2, 2, 3, 2)          # raster width disagrees with the frame header
+    wrong = fmt.MapletHeader(1, 0, 0, 2, 2, 3, 2)
     with pytest.raises(ValueError, match="disagrees"):
         list(fmt.iter_maplets(fmt.encode_frame(fh, [(wrong, np.ones((2, 2)))])))
     outside = fh.maplet_header(1, 0)
@@ -87,8 +85,6 @@ def test_crs_to_epsg():
     assert fmt.crs_to_epsg("not a crs") == 0
 
 
-# ---------------------------------------------------------------- synthetic + tiling
-
 @pytest.mark.parametrize("gen,params", [
     ("ramp", {}), ("checker", {"k": 5}), ("uniform", {"nodata_fraction": 0.2}),
     ("normal", {"nodata_block": [10, 10, 40, 30]}), ("waves", {}), ("constant", {"c": 3.5}),
@@ -96,7 +92,7 @@ def test_crs_to_epsg():
 def test_synthetic_roundtrip_with_partial_tiles(tmp_path, gen, params):
     src = SyntheticSource(70, 45, gen, params, bands=2, n_frames=2, seed=3)
     m = tile_source(src, backend_for(tmp_path), tile_size=16)
-    assert (m.tiling.tiles_x, m.tiling.tiles_y) == (5, 3)          # 70/16, 45/16 rounded up
+    assert (m.tiling.tiles_x, m.tiling.tiles_y) == (5, 3)
     store = TileStore.open(tmp_path)
     assert store.verify().ok
     yy, xx = np.mgrid[0:45, 0:70]
@@ -118,7 +114,7 @@ def test_padding_is_nodata_and_records_are_row_major(tmp_path):
     store = TileStore.open(tmp_path)
     recs = list(store.records(0))
     assert [(h.tile_x, h.tile_y) for h, _ in recs] == [(x, y) for y in range(2) for x in range(3)]
-    last = recs[-1][1][0]                       # tile (2,1): valid 4 cols x 2 rows
+    last = recs[-1][1][0]
     assert np.all(last[:2, :4] == 1.0) and np.isnan(last[2:, :]).all() and np.isnan(last[:, 4:]).all()
 
 
@@ -131,8 +127,6 @@ def test_corruption_is_detected(tmp_path):
     report = TileStore.open(tmp_path).verify()
     assert not report.ok and "sha256" in report.problems[0]
 
-
-# ---------------------------------------------------------------- GeoTIFF source
 
 def _write_tif(path, data, nodata=None, scale=1.0, offset=0.0, transform=None):
     bands, h, w = data.shape
@@ -176,8 +170,6 @@ def test_multiple_files_become_frames_and_grids_must_match(tmp_path):
                     backend_for(tmp_path / "bad"), 8)
 
 
-# ---------------------------------------------------------------- oracle
-
 @pytest.mark.parametrize("shape", oracle.SHAPES)
 @pytest.mark.parametrize("r", [1, 3, 6])
 def test_oracle_matches_naive_definition(shape, r):
@@ -203,8 +195,6 @@ def test_all_nodata_window_yields_nodata():
         out = oracle.focal(a, op, oracle.footprint("square", 1))
         assert out[0, 0] == 1.0 and np.isnan(out[4, 4])
 
-
-# ---------------------------------------------------------------- workloads
 
 def test_focal_reference_is_tiled_like_input_and_independent_of_tile_size(tmp_path):
     src = SyntheticSource(61, 47, "normal", {"nodata_fraction": 0.1}, n_frames=2, seed=5)
@@ -245,8 +235,6 @@ def test_zonal_is_declared_but_not_implemented(tmp_path):
         z.prepare_side_inputs(store.manifest, str(tmp_path / "zones"))
 
 
-# ---------------------------------------------------------------- object storage (fsspec memory://)
-
 def test_object_store_backend_roundtrip():
     loc = "memory://bucket/store1"
     assert isinstance(backend_for(loc), FsspecBackend)
@@ -257,8 +245,6 @@ def test_object_store_backend_roundtrip():
     yy, xx = np.mgrid[0:30, 0:40]
     assert np.array_equal(store.assemble(0)[0], src.values(0, 0, yy, xx), equal_nan=True)
 
-
-# ---------------------------------------------------------------- CLI
 
 def test_cli_end_to_end(tmp_path, capsys):
     s, r, w = str(tmp_path / "s"), str(tmp_path / "r"), str(tmp_path / "w.json")

@@ -1,11 +1,3 @@
-"""Raster sources: where frames come from before tiling.
-
-Every source exposes the same contract: a fixed geometry and a sequence of
-frames, each of which can read any rectangular window as a float64 array of
-shape (bands, rows, cols) with NaN for NoData. The tiler never needs to know
-whether a frame came from a GeoTIFF, a NetCDF file, a generator or memory.
-"""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -21,14 +13,14 @@ from .manifest import RasterInfo
 class FrameReader(ABC):
     @abstractmethod
     def read(self, row: int, col: int, rows: int, cols: int) -> np.ndarray:
-        """Window inside the raster extent -> float64 (bands, rows, cols), NaN = NoData."""
+        ...
 
 
 @dataclass
 class Frame:
     frame_id: int
     event_time_ms: int
-    open: Callable[[], Any]                   # context manager yielding a FrameReader
+    open: Callable[[], Any]
     description: dict[str, Any] = field(default_factory=dict)
 
 
@@ -47,16 +39,7 @@ def _check_window(geom: RasterInfo, row: int, col: int, rows: int, cols: int) ->
         raise ValueError(f"window ({row},{col},{rows},{cols}) outside raster {geom.height}x{geom.width}")
 
 
-# --------------------------------------------------------------------------- rasterio
-
-
 class RasterioSource(RasterSource):
-    """One file per frame; anything GDAL opens (GeoTIFF, COG, VRT, NetCDF subdatasets).
-
-    NoData comes from the dataset's nodata value and masks. Scale and offset
-    metadata (e.g. GOES CMI) are applied by default so cells hold physical values.
-    """
-
     def __init__(self, paths: list[str], bands: list[int] | None = None,
                  event_times_ms: list[int] | None = None, frame_period_ms: int = 0,
                  apply_scale_offset: bool = True):
@@ -73,7 +56,6 @@ class RasterioSource(RasterSource):
 
         with rasterio.open(self.paths[0]) as src:
             if src.count == 0:
-                # a container such as NetCDF/HDF with several variables: GDAL exposes no bands at the top level
                 names = [sd.replace("/", ":").rsplit(":", 1)[-1] for sd in (src.subdatasets or [])]
                 hint = (f"it contains the variables {', '.join(names)}; choose one with --variable NAME"
                         ) if names else "it has no raster bands"
@@ -135,12 +117,7 @@ class _RasterioReader(FrameReader):
         return np.ma.filled(data, np.nan)
 
 
-# --------------------------------------------------------------------------- in-memory
-
-
 class ArraySource(RasterSource):
-    """Frames already in memory, e.g. oracle outputs that are written back as a tile store."""
-
     def __init__(self, geometry: RasterInfo, frames: list[tuple[int, int, np.ndarray]],
                  description: dict[str, Any] | None = None):
         self.geometry = geometry
@@ -171,9 +148,6 @@ def _nullcontext(value):
     yield value
 
 
-# --------------------------------------------------------------------------- synthetic
-
-
 def _splitmix64(z: np.ndarray) -> np.ndarray:
     z = z + np.uint64(0x9E3779B97F4A7C15)
     z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
@@ -182,7 +156,6 @@ def _splitmix64(z: np.ndarray) -> np.ndarray:
 
 
 def _unit(seed: int, stream: int, index: np.ndarray) -> np.ndarray:
-    """Counter-based uniform [0, 1): depends only on (seed, stream, cell index)."""
     key = np.uint64((seed * 0x100000001B3 + stream * 0x9E3779B1) & 0xFFFFFFFFFFFFFFFF)
     with np.errstate(over="ignore"):
         z = _splitmix64(_splitmix64(index.astype(np.uint64) ^ key))
@@ -193,27 +166,6 @@ GENERATORS = ("constant", "ramp", "checker", "uniform", "normal", "waves")
 
 
 class SyntheticSource(RasterSource):
-    """Deterministic synthetic rasters of any size.
-
-    Every cell value is a pure function of (seed, frame, band, y, x), so any
-    window read in any order yields the same values. This keeps the tiler, the
-    oracle and a re-run consistent without storing the full raster.
-
-    Generators and parameters (defaults in brackets):
-      constant  c [1.0]
-      ramp      a [0.01] * x + b [0.02] * y + c [0.0]
-      checker   k [8] cells per square, lo [0.0], hi [1.0]
-      uniform   lo [0.0], hi [1.0]
-      normal    mu [0.0], sigma [1.0]
-      waves     n [6] superposed sinusoids, amplitude [100.0], wavelength [256.0]
-    NoData overlays, applied after the generator:
-      nodata_fraction p [0.0]          each cell independently NoData with probability p
-      nodata_block y0,x0,y1,x1 [none]  half-open rectangle of NoData in global cell coordinates
-    Outlier overlay (high dynamic range, e.g. to break plain running sums), applied before NoData:
-      outlier_fraction p [0.0]         each cell independently replaced by +-outlier_scale with probability p
-      outlier_scale s [1e12]
-    """
-
     def __init__(self, width: int, height: int, generator: str, params: dict[str, Any] | None = None,
                  bands: int = 1, n_frames: int = 1, seed: int = 0, frame_period_ms: int = 1000):
         if generator not in GENERATORS:
@@ -255,7 +207,7 @@ class SyntheticSource(RasterSource):
             u1 = np.maximum(_unit(self.seed, 2, index), 1e-300)
             u2 = _unit(self.seed, 3, index)
             v = float(p.get("mu", 0.0)) + float(p.get("sigma", 1.0)) * np.sqrt(-2 * np.log(u1)) * np.cos(2 * np.pi * u2)
-        else:  # waves: smooth, terrain-like global field
+        else:
             amp, wl = float(p.get("amplitude", 100.0)), float(p.get("wavelength", 256.0))
             ang, phase, scale = self._waves
             v = np.zeros(yy.shape)

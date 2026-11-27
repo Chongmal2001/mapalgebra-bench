@@ -1,28 +1,3 @@
-"""Read a NES ``Binary`` dump and turn it into a candidate output store (``mabench import-nes``).
-
-The dump is what the NES File sink writes with output format ``Binary`` for the sink schema
-``(srcId UINT32, srcFrameId UINT32, ts UINT64, raster VARSIZED)``, all NOT NULL (``docs/maplet-format.md`` §8)::
-
-    text line   DUMP_HEADER_LINE (the File sink's schema line; NES upper-cases unquoted names), then until end of file:
-    +0   u32  srcId         lineage: input store (RasterFile SRC_ID)
-    +4   u32  srcFrameId    lineage: frame header frame_id of the input frame
-    +8   u64  ts            event time of the input frame
-    +16  u32  len           maplet length = 32 + 8 * B * T_h * T_w
-    +20  u8[len] maplet     format-3 maplet: frame_id = focal output frame number (from 1), position, flags, cells
-
-Records arrive in emission order, not sorted by frame or tile. The importer reads the dump twice: a first pass indexes
-every record (offset and preamble only) and runs all checks, a second pass copies the cells frame by frame into the
-output store, so memory is proportional to the number of records, not to the dump size.
-
-Mapping back to the input: records are grouped by the maplet ``frame_id`` (one group = one focal output frame); a group
-maps through ``srcFrameId`` to the input frame of the same ``frame_id`` and is written under that id, so ``compare``
-matches frames. With sliding windows a frame is emitted once per window containing it, possibly under several output
-frame numbers; all copies of a tile must be identical, one is kept, and the number of copies per tile (emission
-multiplicity) is recorded; with ``windows_per_frame`` every tile must have exactly that many copies (else
-``multiplicity_problems``, which ``compare`` counts as coverage problems). ``ts`` is a cross-check against the input frame's event time. Maplets are written with ``frame_id 0``
-and ``flags 0`` as every store file requires; the FILLED flag is kept in the provenance instead.
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -39,6 +14,7 @@ from .storage import backend_for
 from .store import TileStore
 from .tiler import frame_key
 
+# record: srcId u32, srcFrameId u32, ts u64, len u32, maplet (docs/maplet-format.md §8)
 DUMP_HEADER_LINE = (b"srcId:UINT32:NOT_NULLABLE,srcFrameId:UINT32:NOT_NULLABLE,"
                     b"ts:UINT64:NOT_NULLABLE,raster:VARSIZED:NOT_NULLABLE\n")
 DUMP_RECORD = struct.Struct("<IIQI")
@@ -47,7 +23,7 @@ assert DUMP_RECORD.size == 20
 
 @dataclass(frozen=True)
 class DumpRecord:
-    offset: int                 # of the record (its 20-byte head) in the dump
+    offset: int
     src_id: int
     src_frame_id: int
     ts: int
@@ -64,10 +40,9 @@ class DumpRecord:
 
 @dataclass
 class ImportReport:
-    """What ``import_nes`` found besides hard errors; also recorded in the output provenance."""
-    out_frame_of: dict[int, int] = field(default_factory=dict)          # input frame id -> first focal output frame no
-    out_frames_of: dict[int, list[int]] = field(default_factory=dict)   # input frame id -> all its output frame nos
-    multiplicity: dict[int, dict[int, int]] = field(default_factory=dict)   # frame -> {copies: number of tiles}
+    out_frame_of: dict[int, int] = field(default_factory=dict)
+    out_frames_of: dict[int, list[int]] = field(default_factory=dict)
+    multiplicity: dict[int, dict[int, int]] = field(default_factory=dict)
     multiplicity_problems: list[str] = field(default_factory=list)
     filled_tiles: dict[int, list[list[int]]] = field(default_factory=dict)
     missing_tiles: dict[int, list[list[int]]] = field(default_factory=dict)
@@ -96,8 +71,6 @@ class ImportReport:
 
 
 def _read_header_line(fh: BinaryIO, path: str) -> int:
-    """The File sink's schema line. NES prints unquoted identifiers upper-cased (``Identifier`` formatter), so the field
-    names are compared case-insensitively; order, types and nullability must match exactly."""
     line = fh.readline(len(DUMP_HEADER_LINE) + 1)
     if line.upper() != DUMP_HEADER_LINE.upper():
         raise ValueError(f"{path}: first line is {line[:200]!r}, expected the File sink schema line "
@@ -107,8 +80,6 @@ def _read_header_line(fh: BinaryIO, path: str) -> int:
 
 
 def index_dump(path: str, maplet_nbytes: int | None = None) -> list[DumpRecord]:
-    """Every record of a dump with its maplet preamble, in file order. Checks the header line and the framing; with
-    ``maplet_nbytes`` every ``len`` must equal it."""
     records = []
     with open(path, "rb") as fh:
         fh.seek(0, 2)
@@ -148,12 +119,6 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
                provenance: dict[str, Any] | None = None, progress: Callable[[str], None] | None = None,
                windows_per_frame: int | None = None, frames_per_window: int | None = None,
                slide_frames: int | None = None) -> tuple[Manifest, ImportReport]:
-    """Turn a NES dump into an output store on the input's raster and tiling (``bench-capabilities.md`` §9.1).
-
-    ``windows_per_frame``: every tile must be emitted that often. ``frames_per_window`` / ``slide_frames`` (as given
-    to ``nes_query``): the expected count per frame from the window definition instead, i.e. the number of windows that
-    contain the frame's event time; NES creates no window that starts before time 0 (``SliceAssigner``), so frames
-    earlier than one window size are in fewer windows."""
     if getattr(workload, "output_kind", None) is None or workload.output_kind.value != "raster":
         raise ValueError(f"import-nes needs a workload with raster output (focal), not {workload.name}")
     mi = input_store.manifest
@@ -164,7 +129,6 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
     if not records:
         raise ValueError(f"{dump_path}: no records after the header line (did the query produce output?)")
 
-    # ---- per-record checks
     src_ids = {r.src_id for r in records}
     if src_id is not None:
         bad = [r for r in records if r.src_id != src_id]
@@ -189,7 +153,6 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
             raise ValueError(f"{where}: maplet frame_id {r.maplet.frame_id}; focal numbers its output frames from 1 "
                              "(0 = unassigned is a programming error in NES)")
 
-    # ---- grouping by focal output frame, mapping to input frames
     groups: dict[int, list[DumpRecord]] = {}
     for r in records:
         groups.setdefault(r.maplet.frame_id, []).append(r)
@@ -210,7 +173,6 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
         by_input.setdefault(first.src_frame_id, []).extend(recs)
     report.frames_without_output = sorted(set(frames_by_id) - set(report.out_frame_of))
 
-    # ---- placement and writing, one output frame at a time
     backend = backend_for(out_location)
     tiles_x, tiles_y = mi.tiling.tiles_x, mi.tiling.tiles_y
     expected = [(x, y) for y in range(tiles_y) for x in range(tiles_x)]
@@ -297,10 +259,8 @@ def import_nes(dump_path: str, input_store: TileStore, workload, out_location: s
     return manifest, report
 
 
-# --------------------------------------------------------------------------- NES query for a store and workload
-
 NES_OPS = {"sum": "FOCAL_SUM", "mean": "FOCAL_MEAN", "min": "FOCAL_MIN", "max": "FOCAL_MAX"}
-NES_SHAPES = {"square": "SQUARE", "circle": "DISC"}          # DISC must be dy^2 + dx^2 <= r^2 like the oracle
+NES_SHAPES = {"square": "SQUARE", "circle": "DISC"}  # DISC: dy^2 + dx^2 <= r^2, as the oracle
 
 
 DUMP_SCHEMA = (("srcId", "UINT32"), ("srcFrameId", "UINT32"), ("ts", "UINT64"), ("raster", "VARSIZED"))
@@ -308,8 +268,6 @@ SOURCE_SCHEMA = (("ts", "UINT64"), ("srcId", "UINT32"), ("srcFrameId", "UINT32")
 
 
 def window_ms(store: TileStore, frames_per_window: int = 1, slide_frames: int | None = None) -> tuple[int, int]:
-    """(size, slide) in ms of the window ``nes_query`` writes: frames_per_window / slide_frames event-time steps, step =
-    the smallest gap between frame event times."""
     times = sorted(f.event_time_ms for f in store.manifest.frames)
     steps = [b - a for a, b in zip(times, times[1:]) if b > a]
     step = min(steps) if steps else 1000
@@ -317,18 +275,22 @@ def window_ms(store: TileStore, frames_per_window: int = 1, slide_frames: int | 
 
 
 def windows_containing(t: int, size: int, slide: int) -> int:
-    """Number of windows [k * slide, k * slide + size), k >= 0, that contain t."""
     return t // slide - max(0, (t - size) // slide + 1) + 1
 
 
 def duration(ms: int) -> str:
-    """Window length for NES SQL in the largest unit that divides it exactly. The parser reads the number with
-    ``std::stoi``, so it must stay below 2^31 (2,147,483,647 ms = 24.8 days); 8 frames of the 5-day S2 revisit are
-    3,456,000,000 ms but 40 DAY."""
     for unit, size in (("DAY", 86_400_000), ("HOUR", 3_600_000), ("MINUTE", 60_000), ("SEC", 1000), ("MS", 1)):
         if ms % size == 0 and ms // size < 2 ** 31:
             return f"{ms // size} {unit}" if unit != "MS" else f"{ms} ms"
     raise ValueError(f"window of {ms} ms cannot be written for the NES parser (no exact unit below 2^31)")
+
+
+def _focal_subquery(call: str, source: str, clause: str, nest: int) -> list[str]:
+    ind = lambda k: "    " * k
+    lines = [f"{ind(nest)}SELECT ts, srcId, srcFrameId, {call} AS raster", f"{ind(nest)}FROM {source} WINDOW {clause})"]
+    for k in range(nest - 1, 0, -1):
+        lines = [f"{ind(k)}SELECT ts, srcId, srcFrameId, {call} AS raster FROM (", *lines, f"{ind(k)}WINDOW {clause})"]
+    return lines
 
 
 def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "tiles", src_id: int = 1,
@@ -336,22 +298,6 @@ def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "
               store_path: str | None = None, passthrough: bool = False, frames_per_window: int = 1,
               slide_frames: int | None = None, latency_path: str | None = None,
               frame_interval_us: int = 0, pacing_log: str | None = None) -> str:
-    """NES statements that run ``workload`` on ``store`` and write the dump ``import-nes`` reads: RasterFile source,
-    one frame per tumbling window (window size = smallest event-time step between frames), grid context from the
-    manifest in the source configuration, ``FOCAL_*(raster, shape, radius)``, File sink with output format Binary and
-    the dump schema.
-    ``dump_path=None``: Void sink instead (output discarded; throughput runs).
-    ``passthrough=True``: the same source and sink without the focal window (baseline for source and sink cost).
-    ``frames_per_window``: tumbling window of that many event-time steps (several frames per window).
-    ``slide_frames``: sliding window of ``frames_per_window`` steps advancing by ``slide_frames`` steps (each frame is in
-    frames_per_window / slide_frames windows); None or equal to ``frames_per_window`` = tumbling.
-    ``latency_path`` (with ``dump_path=None``): FrameLatency sink instead of Void; the query keeps only ``srcFrameId``
-    and the sink writes, per source frame, when its first and last output arrived (paced runs).
-    ``frame_interval_us`` > 0: paced source, frame k released at t0 + (k - 1) * interval; ``pacing_log``: the
-    source's CSV of scheduled and actual releases (same clock as the FrameLatency sink).
-
-    Default: SQL statements for ``nes-repl-embedded``. ``yaml=True``: a topology file for ``nes-cli`` (one worker).
-    ``store_path`` overrides the store location as NES sees it (e.g. inside a container)."""
     p, m = workload.params(), store.manifest
     if workload.family != "focal":
         raise ValueError(f"no NES query for workload family {workload.family}")
@@ -372,11 +318,8 @@ def nes_query(store: TileStore, workload, dump_path: str | None, source: str = "
     location = location if "://" in location or store_path else os.path.abspath(location)
     call = f"{NES_OPS[p['op']]}(raster, {NES_SHAPES[p['shape']]}, {p['radius']})"
     grid = [("raster_width", r.width), ("raster_height", r.height), ("tile_width", t.tile_size), ("tile_height", t.tile_size)]
-    select = [
-        "SELECT srcId, srcFrameId, ts, raster FROM (",
-        f"    SELECT ts, srcId, srcFrameId, {call} AS raster",
-        f"    FROM {source} WINDOW {clause}) INTO dump",
-    ]
+    select = ["SELECT srcId, srcFrameId, ts, raster FROM (", *_focal_subquery(call, source, clause, p.get("nest", 1))]
+    select[-1] += " INTO dump"
     if passthrough:
         select = [f"SELECT srcId, srcFrameId, ts, raster FROM {source} INTO dump"]
     if latency_path is not None:

@@ -48,7 +48,7 @@ def test_report_writes_figures_and_tables(tmp_path):
     for case, ok in (("max-square-4", True), ("mean-square-4-kahan-w4", True), ("sum-circle-2", False)):
         (res / f"{case}.json").write_text(json.dumps({"passed": ok, "criterion": "exact", "coverage_problems": [],
                                                       "totals": {"all": tot}}))
-    (res / "notes.json").write_text("{}")                          # ignored: not a case name
+    (res / "notes.json").write_text("{}")
     crows = load_correctness(tmp_path / "results")
     assert [(c["mode"], c["fpw"]) for c in crows] == [("exact", 1), ("kahan", 4), ("exact", 1)]
     out = tmp_path / "report"

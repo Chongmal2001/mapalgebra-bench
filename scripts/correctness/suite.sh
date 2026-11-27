@@ -22,10 +22,11 @@ mkdir -p "$RESULTS/correctness"
 
 mapfile -t PLAN < <(python "$BENCH_REPO/scripts/lib/plan.py" "$FILE" "$IDS" "${FILTER:-}" | sort -s -k2,2 -k3,3)
 [[ ${#PLAN[@]} -gt 0 ]] || { echo "no runs for '$IDS' ${FILTER:+(filter $FILTER)}" >&2; exit 2; }
+nest_of() { local kv n=1; for kv in "$@"; do [[ "$kv" == NEST=* ]] && n="${kv#NEST=}"; done; echo "$n"; }
 declare -A LAST_USE
 for i in "${!PLAN[@]}"; do
   eval "set -- ${PLAN[$i]}"
-  LAST_USE["$2|$3"]=$i
+  LAST_USE["$2|$3|$(nest_of "$@")"]=$i
 done
 
 status=0
@@ -33,6 +34,7 @@ for i in "${!PLAN[@]}"; do
   eval "set -- ${PLAN[$i]}"
   id="$1" store="$2" wl="$3" st="$4"; shift 4
   settings="$*"
+  nest="$(nest_of "$@")"
   if [[ "$st" != run ]]; then echo "########## $id $store $wl $settings: skipped (${st#skip:} not in FEATURES)"; continue; fi
   (
     expect=pass
@@ -52,6 +54,7 @@ for i in "${!PLAN[@]}"; do
     fpw="${WINDOW_FRAMES:-1}" slide="${WINDOW_SLIDE:-${WINDOW_FRAMES:-1}}"
     if [[ "$fpw" != 1 || "$slide" != "$fpw" ]]; then w="$w-w$fpw"; fi
     if [[ "$slide" != "$fpw" ]]; then w="${w}s$slide"; fi
+    if [[ "${NEST:-1}" != 1 ]]; then w="$w-n$NEST"; fi
     if [[ -n "${CASE_TAG:-}" ]]; then w="$w-$CASE_TAG"; fi
     report="$RESULTS/correctness/$id/$(basename "$path")/$w.json"
     if [[ -e "$report" && "${FORCE:-0}" != 1 ]]; then echo "########## $id $store $wl $settings: done"; exit 0; fi
@@ -66,9 +69,10 @@ for i in "${!PLAN[@]}"; do
     echo "== $outcome (expected $expect)"
     [[ $ok == yes ]]
   ) || status=1
-  if [[ "${KEEP_REFS:-0}" == 0 && "${LAST_USE[$store|$wl]}" == "$i" ]]; then
-    w="${wl#focal:}"
-    rm -rf "$DATA/refs/geotrellis/$(basename "$("$STORES" --path "$store")")/${w//:/-}"
+  if [[ "${KEEP_REFS:-0}" == 0 && "${LAST_USE[$store|$wl|$nest]}" == "$i" ]]; then
+    w="${wl#focal:}"; w="${w//:/-}"
+    if [[ "$nest" != 1 ]]; then w="$w-n$nest"; fi
+    rm -rf "$DATA"/refs/*/"$(basename "$("$STORES" --path "$store")")/$w"   # GeoTrellis or oracle reference
   fi
 done
 

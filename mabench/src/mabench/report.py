@@ -1,14 +1,3 @@
-"""Figures and tables from benchmark results (``mabench report``).
-
-Inputs: ``perf.csv`` (``mabench perf-table``, one row per run) and the correctness reports of ``mabench compare``
-(``<results>/<store>/<case>.json``). Every figure is regenerated from these files; nothing is edited by hand.
-
-Aggregation: median over repetitions, min / max as error bars. Throughput = cells / elapsed time, with cells = tiles x
-bands x tile_size^2 for both systems (edge padding included). Older perf.csv files (``wall_s``, ``peak_mem_bytes``)
-are read as ``elapsed_s`` and, for NES, ``rss_hwm_bytes``. Memory is NES only (worker RSS); GeoTrellis memory is not
-measured. Figures are PNG.
-"""
-
 from __future__ import annotations
 
 import csv
@@ -25,10 +14,8 @@ LABEL = {"nes": "NES", "nes-exact": "NES (exact)", "nes-running": "NES (running 
 STYLE = {"nes": ("#1f4e9c", "o", "-"), "nes-exact": ("#7fb3ef", "D", ":"), "nes-running": ("#4f8fdc", "s", "--"),
          "geotrellis": ("#c0392b", "^", "-"), "nes-passthrough": ("#7f7f7f", "", ":")}
 CASE = re.compile(r"^(?P<op>[a-z]+)-(?P<shape>[a-z]+)-(?P<r>\d+)(?:-(?P<mode>running|kahan))?"
-                  r"(?:-w(?P<w>\d+)(?:s(?P<s>\d+))?)?(?:-(?P<tag>[A-Za-z0-9_]+))?$")
+                  r"(?:-w(?P<w>\d+)(?:s(?P<s>\d+))?)?(?:-n(?P<n>\d+))?(?:-(?P<tag>[A-Za-z0-9_]+))?$")
 
-
-# --------------------------------------------------------------------------- data
 
 def load_perf(path: str | Path) -> list[dict[str, Any]]:
     num = {"threads", "rep", "frames", "frames_per_window", "radius", "cells", "bands", "tile_size"}
@@ -38,7 +25,7 @@ def load_perf(path: str | Path) -> list[dict[str, Any]]:
            "peak_rss_bytes", "mean_rss_bytes", "rss_hwm_bytes"}
     rows = []
     for r in csv.DictReader(open(path, newline="")):
-        if "elapsed_s" not in r:                                   # perf.csv before the rename
+        if "elapsed_s" not in r:
             r["elapsed_s"] = r.get("wall_s")
             if r.get("mem_kind") != "jvm_heap_used":
                 r["rss_hwm_bytes"] = r.get("peak_mem_bytes")
@@ -51,7 +38,6 @@ def load_perf(path: str | Path) -> list[dict[str, Any]]:
 
 
 def aggregate(rows: list[dict[str, Any]], key: str) -> dict[tuple, tuple[float, float, float, int]]:
-    """(store, op, shape, radius, fpw, system, threads) -> (median, min, max, n) of ``key``."""
     groups: dict[tuple, list[float]] = defaultdict(list)
     for r in rows:
         if r.get(key) is not None:
@@ -61,8 +47,6 @@ def aggregate(rows: list[dict[str, Any]], key: str) -> dict[tuple, tuple[float, 
 
 
 def load_correctness(results: str | Path) -> list[dict[str, Any]]:
-    """One row per compare report: ``<case id>/<store>/<run>.json`` (scripts/correctness/suite.sh) or, from result sets
-    before case ids, ``<store>/<run>.json``."""
     rows = []
     root = Path(results)
     for f in sorted(list(root.glob("*/*.json")) + list(root.glob("*/*/*.json"))):
@@ -75,7 +59,7 @@ def load_correctness(results: str | Path) -> list[dict[str, Any]]:
                      "case_id": f.parent.parent.name if f.parent.parent != root else "", "tag": m["tag"] or "",
                      "op": m["op"], "shape": m["shape"],
                      "radius": int(m["r"]), "mode": m["mode"] or "exact", "fpw": int(m["w"] or 1),
-                     "slide": int(m["s"] or m["w"] or 1), "tol_util": t.get("max_tol_util"),
+                     "slide": int(m["s"] or m["w"] or 1), "nest": int(m["n"] or 1), "tol_util": t.get("max_tol_util"),
                      "missing_input_tiles": sum(rep.get("missing_input_tiles", {}).values()),
                      "passed": rep["passed"], "criterion": rep["criterion"], "data_cells": t["data_both"],
                      "exact_rate": t["exact_rate"], "tolerance_rate": t["tolerance_rate"], "max_ulp": t["max_ulp"],
@@ -84,8 +68,6 @@ def load_correctness(results: str | Path) -> list[dict[str, Any]]:
                      "coverage_problems": len(rep["coverage_problems"])})
     return rows
 
-
-# --------------------------------------------------------------------------- figures
 
 def _plt():
     try:
@@ -99,7 +81,6 @@ def _plt():
 
 
 def _axes_style(ax, radii, logy: bool = True, suffix: str = "") -> None:
-    """Radius axis log2 with the measured radii as plain labels; plain numbers on a log y axis."""
     from matplotlib.ticker import FuncFormatter, NullFormatter
     ax.set_xscale("log", base=2)
     ax.set_xticks(sorted(radii), [str(r) for r in sorted(radii)])
@@ -133,7 +114,6 @@ def _grid(plt, n_rows: int, n_cols: int, w: float = 4.2, h: float = 3.2):
 
 
 def throughput_figure(rows, store, shape, out, formats, threads=1) -> list[Path]:
-    """Throughput vs radius; columns = op, rows = frames per window; one line per system."""
     plt = _plt()
     agg = aggregate([r for r in rows if r["threads"] == threads or r["system"] == "geotrellis"],
                     "throughput_cells_per_s")
@@ -165,7 +145,7 @@ def throughput_figure(rows, store, shape, out, formats, threads=1) -> list[Path]
             ax.set_ylabel("throughput (Mcells/s)")
             ax.set_title(f"{op} {shape}, {fpw} frame(s)/window")
     seen: dict[str, Any] = {}
-    for ax in axes.flat:                                     # union over panels (running / Kahan only under mean)
+    for ax in axes.flat:
         for h, lab in zip(*ax.get_legend_handles_labels()):
             seen.setdefault(lab, h)
     fig.legend(list(seen.values()), list(seen), loc="lower center", ncol=min(len(seen), 3),
@@ -178,7 +158,6 @@ def throughput_figure(rows, store, shape, out, formats, threads=1) -> list[Path]
 
 
 def speedup_figure(rows, store, shape, out, formats, threads=1) -> list[Path]:
-    """Throughput of each NES variant divided by GeoTrellis (medians); > 1 = NES faster."""
     plt = _plt()
     agg = aggregate(rows, "throughput_cells_per_s")
     ops = sorted({k[1] for k in agg if k[0] == store and k[2] == shape and k[5] == "geotrellis"})
@@ -213,7 +192,6 @@ def speedup_figure(rows, store, shape, out, formats, threads=1) -> list[Path]:
 
 
 def window_figure(rows, store, shape, out, formats) -> list[Path]:
-    """Throughput with n frames per window relative to 1 frame per window, per system and radius."""
     plt = _plt()
     agg = aggregate(rows, "throughput_cells_per_s")
     fpws = sorted({k[4] for k in agg if k[0] == store and k[2] == shape} - {1})
@@ -234,7 +212,7 @@ def window_figure(rows, store, shape, out, formats) -> list[Path]:
         ax.axhline(1.0, color="black", lw=0.8)
         _axes_style(ax, {k[3] for k in agg if k[0] == store and k[1] == op and k[2] == shape}, logy=False)
         lo, hi = ax.get_ylim()
-        ax.set_ylim(min(lo, 0.8), max(hi, 1.2))               # do not blow run-to-run noise up into a trend
+        ax.set_ylim(min(lo, 0.8), max(hi, 1.2))
         ax.set_xlabel("radius r (cells)")
         ax.set_ylabel("throughput relative to 1 frame/window")
         ax.set_title(f"{op} {shape}")
@@ -247,8 +225,6 @@ def window_figure(rows, store, shape, out, formats) -> list[Path]:
 
 
 def breakdown_figure(rows, store, shape, op, out, formats) -> list[Path]:
-    """Where the time goes, per radius (1 frame/window): NES elapsed vs source+sink alone; GeoTrellis elapsed split
-    into focal compute (neighbour buffering + kernel), GC and the rest (reading and preparing frames)."""
     plt = _plt()
     sel = [r for r in rows if r["store"] == store and r["frames_per_window"] == 1]
     wall, comp, gc = (aggregate(sel, k) for k in ("elapsed_s", "compute_s", "gc_s"))
@@ -285,9 +261,6 @@ def breakdown_figure(rows, store, shape, op, out, formats) -> list[Path]:
 
 
 def memory_figure(rows, store, shape, out, formats) -> list[Path]:
-    """Peak NES worker RSS per system variant and frames per window (median over radii and reps), inside the measured
-    span (VmHWM over the worker's life where no samples exist). Includes the preallocated buffer pool; passthrough shows
-    that floor."""
     plt = _plt()
     sel = [r for r in rows if r["store"] == store and r["shape"] == shape and r["system"].startswith("nes")]
     rss: dict[tuple, list[float]] = defaultdict(list)
@@ -317,7 +290,6 @@ def memory_figure(rows, store, shape, out, formats) -> list[Path]:
 
 
 def _span_and_samples(run_dir: Path) -> tuple[int, int, list] | None:
-    """(t0_us, t1_us, samples) of one NES run: status.json + resources.csv."""
     from .perf import read_resources
     samples = read_resources(run_dir / "resources.csv")
     if not samples or not (run_dir / "status.json").exists():
@@ -328,8 +300,6 @@ def _span_and_samples(run_dir: Path) -> tuple[int, int, list] | None:
 
 
 def timeline_figure(rows, store, shape, op, out, formats) -> list[Path]:
-    """NES worker RSS over time of one run per system variant (largest frames per window, radius closest to 4, first
-    repetition), time 0 = start of the measured span. Bounded state: no growth with the frames processed."""
     plt = _plt()
     sel = [r for r in rows if r["store"] == store and r["shape"] == shape and r["op"] == op and r.get("run_dir")
            and r["system"].startswith("nes")]
@@ -369,14 +339,12 @@ def timeline_figure(rows, store, shape, op, out, formats) -> list[Path]:
 
 
 def correctness_figure(crows, out, formats) -> list[Path]:
-    """Matrix: one row per (store, op, shape, summation), one column per (radius, frames per window); colour =
-    PASS / FAIL, text = exact rate."""
     plt = _plt()
     if not crows:
         return []
-    rows_k = sorted({(c.get("case_id", ""), c["store"], c["op"], c["shape"], c["mode"]) for c in crows})
+    rows_k = sorted({(c.get("case_id", ""), c["store"], c["op"], c["shape"], c["mode"], c.get("nest", 1)) for c in crows})
     cols_k = sorted({(c["radius"], c["fpw"], c.get("slide", c["fpw"])) for c in crows})
-    cell = {((c.get("case_id", ""), c["store"], c["op"], c["shape"], c["mode"]),
+    cell = {((c.get("case_id", ""), c["store"], c["op"], c["shape"], c["mode"], c.get("nest", 1)),
              (c["radius"], c["fpw"], c.get("slide", c["fpw"]))): c for c in crows}
     fig, ax = plt.subplots(figsize=(0.75 * len(cols_k) + 3, 0.28 * len(rows_k) + 1.4))
     for i, rk in enumerate(rows_k):
@@ -394,7 +362,7 @@ def correctness_figure(crows, out, formats) -> list[Path]:
                   fontsize=7)
     ax.set_yticks([i + 0.5 for i in range(len(rows_k))],
                   [(f"{k} " if k else "") + f"{s}: {o} {sh}" + ("" if m == "exact" else f" ({m})")
-                   for k, s, o, sh, m in rows_k], fontsize=7)
+                   + ("" if n == 1 else f" x{n}") for k, s, o, sh, m, n in rows_k], fontsize=7)
     ax.grid(False)
     n_pass = sum(c["passed"] for c in crows)
     ax.set_title(f"Correctness vs GeoTrellis full-grid reference: {n_pass}/{len(crows)} PASS "
@@ -404,8 +372,6 @@ def correctness_figure(crows, out, formats) -> list[Path]:
     plt.close(fig)
     return paths
 
-
-# --------------------------------------------------------------------------- tables
 
 def perf_markdown(rows) -> str:
     agg = aggregate(rows, "throughput_cells_per_s")
@@ -472,7 +438,7 @@ def report(perf_csv: str | Path | None, results: str | Path | None, out: str | P
     md = ["# Benchmark report", ""]
     if perf_csv and Path(perf_csv).exists():
         allrows = load_perf(perf_csv)
-        rows = [r for r in allrows if not r.get("rate_fps")]                  # maximum-rate runs
+        rows = [r for r in allrows if not r.get("rate_fps")]
         paced = [r for r in allrows if r.get("rate_fps")]
         for store in sorted({r["store"] for r in rows}):
             for shape in sorted({r["shape"] for r in rows if r["store"] == store and r["system"] != "nes-passthrough"}):

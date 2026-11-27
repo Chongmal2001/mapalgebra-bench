@@ -13,7 +13,8 @@
 # GT_WARMUP (untimed GeoTrellis warm-up frames, default 1), GT_HEAP (sbt, bench.env: 12g), WINDOW_FRAMES (frames per tumbling
 # window, default 1; GeoTrellis then triggers per window instead of per frame), WINDOW_SLIDE (NES only: sliding window
 # advancing by that many frames; run directory -w<N>s<S>, system name -s<S>), GT_CPUSET (taskset cores for GeoTrellis,
-# default DOCKER_CPUSET, which pins NES), GT_JAVA_OPTS (extra JVM options), VARIANT (suffix of the run directory, e.g.
+# default DOCKER_CPUSET, which pins NES), CPUSET_PER_THREAD=1 (pin each run to cores 0..T-1 for its thread count T instead
+# of DOCKER_CPUSET / GT_CPUSET; used by the thread grid G2), GT_JAVA_OPTS (extra JVM options), VARIANT (suffix of the run directory, e.g.
 # for runs with other JVM options or with NES_EVENT_TRACE=1), RATE (frames/s, paced input: GeoTrellis --rate; NES
 # source FRAME_INTERVAL_US with its pacing.csv and the FrameLatency sink's frame-latency.csv instead of Void; needs a
 # NES build with both, FEATURES nes-pacing). WARM_INPUT=1 (default) reads the store into the page cache before each run
@@ -41,7 +42,6 @@ SYSTEMS="${SYSTEMS:-nes geotrellis}"
 THREADS="${PERF_THREADS:-1}"
 GT_WARMUP="${GT_WARMUP:-1}"
 GT_CPUSET="${GT_CPUSET:-$DOCKER_CPUSET}"
-GT_PIN=(); if [[ -n "$GT_CPUSET" ]]; then GT_PIN=(taskset -c "$GT_CPUSET"); fi
 [[ -e "$STORE/manifest.json" ]] || { echo "error: $STORE is not a tile store" >&2; exit 1; }
 WARM_STORE="$DATA/stores/$(basename "$STORE")-warm1"
 if [[ " $SYSTEMS " == *" nes"* && "${NES_WARMUP:-1}" == 1 && ! -e "$WARM_STORE/manifest.json" ]]; then
@@ -68,6 +68,9 @@ for k in $(seq 1 "$REPS"); do
       geotrellis) T="${GT_THREADS:-$THREADS}"; BUILD="GT_HEAP=${GT_HEAP:-4g}"; CPUSET="$GT_CPUSET" ;;
       *) echo "error: unknown system $sys" >&2; exit 2 ;;
     esac
+    # Pinning: a fixed cpuset suits single-threaded runs only; with more threads every run gets as many cores as threads.
+    if [[ "${CPUSET_PER_THREAD:-0}" == 1 ]]; then CPUSET="0-$((T - 1))"; fi
+    PIN=(); if [[ -n "$CPUSET" ]]; then PIN=(taskset -c "$CPUSET"); fi
     if [[ "$sys" == geotrellis && "$SLIDE" != "$FPW" ]]; then
       echo "== geotrellis: no sliding windows in the micro-batch runner (WINDOW_SLIDE=$SLIDE); skipped" >&2; continue
     fi
@@ -88,7 +91,7 @@ for k in $(seq 1 "$REPS"); do
         --slide-frames "$SLIDE" "${PT[@]}" > "$D/topology.yaml"
       SUM=kahan; case "$sys" in nes-exact) SUM=exact ;; nes-running) SUM=running ;; esac
       export NES_THREADS="$T" NES_FOCAL_SUMMATION="$SUM"
-      if ! "$REPO/scripts/nes/worker.sh" start "$D"; then status=1; continue; fi
+      if ! NES_CPUSET="$CPUSET" "$REPO/scripts/nes/worker.sh" start "$D"; then status=1; continue; fi
       ok=1
       if [[ "${NES_WARMUP:-1}" == 1 ]]; then
         mkdir -p "$D/warmup"
@@ -101,7 +104,7 @@ for k in $(seq 1 "$REPS"); do
       unset NES_FOCAL_SUMMATION
       if [[ $ok == 0 ]]; then status=1; continue; fi
     else
-      if ! (cd "$REPO/geotrellis-baseline" && "${GT_PIN[@]}" sbt -batch "run --mode microbatch --store $STORE --workload $WORKLOAD \
+      if ! (cd "$REPO/geotrellis-baseline" && "${PIN[@]}" sbt -batch "run --mode microbatch --store $STORE --workload $WORKLOAD \
             --out $D --threads $T --rate $RATE $GT_WINDOW --output none --warmup $GT_WARMUP --no-verify") > "$D/gt.log" 2>&1; then
         tail -n 20 "$D/gt.log" >&2; status=1; continue
       fi
@@ -110,7 +113,9 @@ for k in $(seq 1 "$REPS"); do
 {"system": "$sys", "store": "$STORE", "workload": "$WORKLOAD", "threads": $T, "rep": $k, "frames_per_window": $FPW, "slide_frames": $SLIDE,
  "build": "$BUILD", "cpuset": "$CPUSET", "host": "$(hostname)", "started_utc": "$started",
  "warm_input": ${WARM_INPUT:-1}, "nes_warmup": ${NES_WARMUP:-1}, "gt_warmup_frames": $GT_WARMUP,
- "variant": "${VARIANT:-}", "rate_fps": $RATE, "gt_java_opts": "${GT_JAVA_OPTS:-}", "event_trace": ${NES_EVENT_TRACE:-0}}
+ "variant": "${VARIANT:-}", "rate_fps": $RATE, "gt_java_opts": "${GT_JAVA_OPTS:-}", "event_trace": ${NES_EVENT_TRACE:-0},
+ "cpuset_per_thread": ${CPUSET_PER_THREAD:-0}, "nes_worker_args": "${NES_WORKER_ARGS:-}",
+ "nes_pool_buffers": "${NES_POOL_BUFFERS:-}", "gt_heap": "${GT_HEAP:-}"}
 EOF
   done
 done

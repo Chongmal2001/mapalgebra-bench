@@ -1,5 +1,3 @@
-"""Read and verify tile stores."""
-
 from __future__ import annotations
 
 import hashlib
@@ -14,7 +12,6 @@ from .storage import StorageBackend, backend_for
 
 
 def _close(buf) -> None:
-    """Close an mmap; if numpy views still reference it, leave it to the garbage collector."""
     if hasattr(buf, "close"):
         try:
             buf.close()
@@ -32,9 +29,6 @@ class VerifyReport:
 
 
 class FrameRows:
-    """One frame, its maplets indexed by tile row once, so each strip touches only its own tiles.
-    Cells stay views into the frame buffer until ``close``."""
-
     def __init__(self, store: "TileStore", frame_id: int):
         m = store.manifest
         self.bands, self.s, self.H, self.W = m.raster.bands, m.tiling.tile_size, m.raster.height, m.raster.width
@@ -43,7 +37,7 @@ class FrameRows:
         self.keys: list[tuple[int, int]] = []
         self._rows: dict[int, list[tuple[int, np.ndarray]]] = {}
         for h, cells in fmt.iter_maplets(self._buf):
-            if h.flags & fmt.FLAG_LATE:      # belongs to an earlier frame
+            if h.flags & fmt.FLAG_LATE:
                 continue
             self.keys.append((h.tile_x, h.tile_y))
             self._rows.setdefault(h.tile_y, []).append((h.tile_x, cells))
@@ -56,7 +50,7 @@ class FrameRows:
         for ty in range(row0 // s, (row1 - 1) // s + 1):
             t0 = ty * s
             a, b = max(row0, t0), min(row1, t0 + s)
-            for tx, cells in self._rows.get(ty, ()):     # file order, so a later duplicate wins as before
+            for tx, cells in self._rows.get(ty, ()):
                 out[:, a - row0:b - row0, tx * s:(tx + 1) * s] = cells[:, a - t0:b - t0, :]
         return out[:, :, :self.W]
 
@@ -91,7 +85,6 @@ class TileStore:
             _close(buf)
 
     def records(self, frame_id: int) -> Iterator[tuple[fmt.MapletHeader, np.ndarray]]:
-        """(maplet header, cells) per tile, in file order. Cells are copies, safe to keep."""
         buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
         try:
             for header, cells in fmt.iter_maplets(buf):
@@ -100,7 +93,6 @@ class TileStore:
             _close(buf)
 
     def keys(self, frame_id: int) -> list[tuple[int, int]]:
-        """(tile_x, tile_y) of every record, in file order, without copying any cells."""
         buf = self.backend.read_buffer(self.manifest.frame(frame_id).key)
         try:
             return [(h.tile_x, h.tile_y) for h, _ in fmt.iter_maplets(buf)]
@@ -108,19 +100,13 @@ class TileStore:
             _close(buf)
 
     def assemble(self, frame_id: int) -> np.ndarray:
-        """Whole frame as (bands, height, width), padding cropped away. Needs the whole frame in memory;
-        use ``assemble_rows`` to work through large frames strip by strip."""
         return self.assemble_rows(frame_id, 0, self.manifest.raster.height)
 
     def assemble_rows(self, frame_id: int, row0: int, row1: int) -> np.ndarray:
-        """Rows [row0, row1) of a frame as (bands, row1 - row0, width); only the tiles overlapping those rows
-        are copied, so memory is proportional to the strip, not the frame. Missing tiles stay NaN.
-        For many strips of one frame use ``frame_rows`` (indexes the frame once)."""
         with self.frame_rows(frame_id) as f:
             return f.rows(row0, row1)
 
     def verify(self) -> VerifyReport:
-        """Checksums, frame header vs manifest, maplet headers, tile grid completeness, valid cells, padding."""
         m, report = self.manifest, VerifyReport()
         s, bands = m.tiling.tile_size, m.raster.bands
         expected_keys = {(x, y) for y in range(m.tiling.tiles_y) for x in range(m.tiling.tiles_x)}
